@@ -1,0 +1,1557 @@
+# handlers.py — All bot command, callback, and message handlers
+
+import time
+import uuid
+import threading
+import logging
+
+from telebot import types
+
+import telebot
+from config import (
+    MAIN_ADMIN_ID, MUTE_SECONDS, DEL_COUNTDOWN, SPAM_WINDOW, SPAM_LIMIT,
+    LOW_TIME_WARN, GRACE_SECONDS, PHOTO_REWARD_SECS, VIDEO_REWARD_PER_MB,
+    BYTES_PER_MIN, REFERRAL_REWARD_SECS,
+)
+from database import (
+    get_user, upsert_user, set_display_name, touch_user, ban_user, unban_user,
+    deactivate_user, set_mute, clear_mute, set_role, active_users, all_users_paged,
+    is_admin, is_main_admin, get_access_seconds, add_access_time, has_access,
+    _row_has_access, _row_access_secs, user_count, stats,
+    get_batch_by_msg, get_batch_msgs, get_all_relay_msgs,
+    delete_relay_log_all, delete_relay_log_batch, log_relay,
+    get_media_settings, set_media_field, is_muted, mute_remaining_secs,
+    get_referral_code, get_pending_referral, mark_referral_rewarded, get_referral_count,
+    get_user_media_count,
+)
+from utils import (
+    md, fmt_time, time_bar, parse_duration, parse_del_time,
+    user_info_text, admin_panel_text, media_settings_text,
+)
+from keyboards import (
+    user_time_keyboard, user_time_keyboard_refresh, admin_keyboard,
+    users_keyboard, user_action_keyboard, banned_users_keyboard,
+    media_keyboard, referral_keyboard, backups_keyboard,
+    user_main_keyboard, profile_keyboard, leave_confirm_keyboard,
+)
+from backup_manager import backup_message_media, is_duplicate_media
+
+log = logging.getLogger("relay")
+
+# ── Shared state ─────────────────────────────────────────────────────────────
+from collections import deque
+_spam       = {}
+_spam_lock  = threading.Lock()
+_awaiting   = {}
+_awaiting_lock = threading.Lock()
+_del_lock        = threading.Lock()
+_del_running     = False
+_del_cancel_evt  = threading.Event()   # set() → cancels the pending deletion
+_shutdown   = threading.Event()
+
+_CAP_TYPES  = ("photo", "video", "animation", "audio", "document", "voice")
+_DEAD_ERRS  = ("bot was blocked", "user is deactivated", "chat not found",
+               "forbidden", "have no rights")
+
+bot: telebot.TeleBot = None   # injected by main.py
+
+
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+def _safe(fn, *args, target_uid=None, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        err = str(e).lower()
+        if any(x in err for x in _DEAD_ERRS):
+            if target_uid:
+                deactivate_user(target_uid)
+                log.info("Auto-deactivated %s: %s", target_uid, e)
+            return None
+        log.warning("Send error (uid=%s): %s", target_uid, e)
+        return None
+
+
+def check_spam(uid) -> bool:
+    now = time.time()
+    with _spam_lock:
+        dq = _spam.setdefault(uid, deque())
+        while dq and now - dq[0] > SPAM_WINDOW:
+            dq.popleft()
+        dq.append(now)
+        return len(dq) > SPAM_LIMIT
+
+
+def prune_memory_state():
+    now = time.time()
+    with _spam_lock:
+        stale = [uid for uid, dq in _spam.items()
+                 if not dq or now - dq[-1] > SPAM_WINDOW]
+        for uid in stale:
+            del _spam[uid]
+    with _awaiting_lock:
+        if len(_awaiting) > 1000:
+            _awaiting.clear()
+            log.warning("Cleared _awaiting state: exceeded safety cap")
+
+
+# ── Relay core ────────────────────────────────────────────────────────────────
+
+def _relay_to(source_chat_id, message, target_uid, prefix) -> list:
+    tid  = target_uid
+    cap  = prefix.strip() + ("\n\n" + message.caption if message.caption else "")
+    sent = []
+
+    def _s(fn, *a, **kw):
+        m = _safe(fn, *a, target_uid=tid, **kw)
+        if m and hasattr(m, "message_id"):
+            sent.append(m.message_id)
+
+    if message.text:
+        _s(bot.send_message, tid, prefix + message.text)
+    elif any(getattr(message, t, None) for t in _CAP_TYPES):
+        _s(bot.copy_message,
+           chat_id=tid, from_chat_id=source_chat_id,
+           message_id=message.message_id, caption=cap)
+    elif message.location:
+        _s(bot.send_message, tid, prefix.strip())
+        _s(bot.send_location, tid,
+           message.location.latitude, message.location.longitude)
+    elif message.contact:
+        _s(bot.send_message, tid, prefix.strip())
+        _s(bot.send_contact, tid,
+           message.contact.phone_number, message.contact.first_name,
+           last_name=message.contact.last_name or "")
+    elif message.dice:
+        _s(bot.send_message, tid,
+           prefix + f"🎲 {message.dice.emoji} => {message.dice.value}")
+    elif message.poll:
+        _s(bot.send_message, tid,
+           prefix + f"📊 Poll: {message.poll.question}")
+    else:
+        _s(bot.send_message, tid, prefix.strip())
+        _s(bot.copy_message, chat_id=tid, from_chat_id=source_chat_id,
+           message_id=message.message_id)
+    return sent
+
+
+def relay_message(sender_uid, source_chat_id, message):
+    try:
+        sender  = get_user(sender_uid)
+        if sender is None:
+            return
+        targets = active_users(exclude_id=sender_uid)
+        if not targets:
+            return
+        name   = sender["display_name"] or sender["random_id"]
+        badge  = " 🛡" if sender["role"] >= 1 else ""
+        prefix = f"📩 {name}{badge}\n\n"
+        batch  = str(uuid.uuid4())
+        for t in targets:
+            if _shutdown.is_set():
+                break
+            tid = t["user_id"]
+            if not _row_has_access(t):
+                continue
+            mids = _relay_to(source_chat_id, message, tid, prefix)
+            for mid in mids:
+                log_relay(batch, sender_uid, tid, mid)
+            time.sleep(0.05)
+    except Exception as e:
+        log.error("relay_message crashed (sender=%s): %s", sender_uid, e, exc_info=True)
+
+
+# ── Notification helpers ──────────────────────────────────────────────────────
+
+def _notify_unmuted(target_uid):
+    """Send the unmuted user a private notification."""
+    _safe(bot.send_message, target_uid,
+          "🔊 *You have been unmuted*\n"
+          "━━━━━━━━━━━━━━━━━\n\n"
+          "You can send messages on NightVi again.",
+          parse_mode="Markdown", target_uid=target_uid)
+
+
+def _notify_unbanned(target_uid):
+    """Send the unbanned user a private notification."""
+    _safe(bot.send_message, target_uid,
+          "🟢 *You have been unbanned*\n"
+          "━━━━━━━━━━━━━━━━━\n\n"
+          "Your access to NightVi has been restored.\n"
+          "Send /start to rejoin.",
+          parse_mode="Markdown", target_uid=target_uid)
+
+
+def _notify_muted(target_uid, duration_secs: int, reason: str = None):
+    """Send the muted user a private notification."""
+    dur_str = fmt_time(duration_secs)
+    text = (
+        "🔇 *You have been muted*\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
+        f"⏱ Duration: *{dur_str}*\n"
+    )
+    if reason:
+        text += f"📝 Reason: _{md(reason)}_\n"
+    text += "\nYou will be unmuted automatically when the duration expires."
+    _safe(bot.send_message, target_uid, text, parse_mode="Markdown",
+          target_uid=target_uid)
+
+
+def _notify_banned(target_uid, reason: str = None):
+    """Send the banned user a private notification."""
+    text = (
+        "🚫 *You have been banned*\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
+        "You have been permanently banned from NightVi.\n"
+    )
+    if reason:
+        text += f"📝 Reason: _{md(reason)}_\n"
+    text += "\nIf you believe this is a mistake, contact the admin."
+    _safe(bot.send_message, target_uid, text, parse_mode="Markdown",
+          target_uid=target_uid)
+
+
+# ── Referral reward helper ────────────────────────────────────────────────────
+
+def _process_referral_reward(new_uid: int):
+    """
+    Check if new_uid was referred by someone and grant rewards.
+    Called once after a brand-new user's first /start.
+    """
+    ref_row = get_pending_referral(new_uid)
+    if not ref_row:
+        return
+    referrer_id = ref_row["referrer_id"]
+
+    # Add +2 hours to both parties
+    add_access_time(referrer_id, REFERRAL_REWARD_SECS)
+    add_access_time(new_uid,     REFERRAL_REWARD_SECS)
+    mark_referral_rewarded(ref_row["id"])
+
+    ref_count = get_referral_count(referrer_id)
+    # Notify referrer
+    _safe(bot.send_message, referrer_id,
+          f"🎉 *Referral reward!*\n\n"
+          f"Someone joined using your link.\n"
+          f"⏰ *+{fmt_time(REFERRAL_REWARD_SECS)}* added to your balance!\n"
+          f"🔗 Total successful referrals: *{ref_count}*",
+          parse_mode="Markdown", target_uid=referrer_id)
+
+    # Notify new user
+    _safe(bot.send_message, new_uid,
+          f"🎉 *Welcome bonus!*\n\n"
+          f"You joined via a referral link.\n"
+          f"⏰ *+{fmt_time(REFERRAL_REWARD_SECS)}* added to your balance!",
+          parse_mode="Markdown", target_uid=new_uid)
+
+    log.info("Referral reward: referrer=%s referred=%s (+%ds each)",
+             referrer_id, new_uid, REFERRAL_REWARD_SECS)
+
+
+# ── /start ─────────────────────────────────────────────────────────────────
+
+def cmd_start(msg: types.Message):
+    uid      = msg.from_user.id
+    username = msg.from_user.username
+
+    # Parse referral code from /start payload
+    parts   = msg.text.strip().split(maxsplit=1)
+    ref_arg = parts[1].strip() if len(parts) > 1 else None
+    ref_code = ref_arg if (ref_arg and ref_arg.startswith("ref_")) else None
+
+    rid, is_new = upsert_user(uid, username, referral_code=ref_code)
+    if rid is None:
+        bot.reply_to(msg, "🚫 You are banned from NightVi.")
+        return
+    touch_user(uid)
+
+    # Grant referral rewards for brand-new users
+    if is_new:
+        threading.Thread(
+            target=_process_referral_reward, args=(uid,), daemon=True
+        ).start()
+
+    n    = user_count()
+    secs = get_access_seconds(uid) if not is_admin(uid) else -1
+    if is_admin(uid):
+        time_line = "🛡 Admin — unlimited access"
+        kb = admin_keyboard(uid)
+    elif secs > 0:
+        time_line = f"⏳ Time balance: *{fmt_time(secs)}*\n`{time_bar(secs)}`"
+        kb = user_main_keyboard()
+    else:
+        time_line = "⏳ Time balance: *0 min* — send media to earn time"
+        kb = user_main_keyboard()
+
+    bot.reply_to(msg,
+        f"✦ *Welcome to NightVi*\n"
+        f"━━━━━━━━━━━━━━━━━\n\n"
+        f"🆔 Your ID: `{rid}`\n"
+        f"👥 Members: *{n}*\n"
+        f"{time_line}\n\n"
+        f"📨 Every message is delivered anonymously.\n"
+        f"📸 Photo → *+1 min*  ·  📹 1 MB video → *+5 min*",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    log.info("User %s joined (rid=%s, new=%s)", uid, rid, is_new)
+
+
+# ── /help ──────────────────────────────────────────────────────────────────
+
+def cmd_help(msg: types.Message):
+    is_adm = is_admin(msg.from_user.id)
+    text = _help_text(is_adm)
+    bot.reply_to(msg, text, parse_mode="Markdown")
+
+
+def _help_text(is_adm: bool) -> str:
+    text = (
+        "❓ *NightVi — Help*\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
+        "📨 Every message you send is relayed *anonymously*.\n\n"
+        "👤 *Profile* — tap the Profile button\n"
+        "  View your ID, set display name, check balance\n\n"
+        "🔗 *Referral* — tap the Referral button\n"
+        "  Invite friends — you *both* get +2 hours on join\n\n"
+        "⏱ *Earn Time*\n"
+        "  📸 Photo → +1 minute\n"
+        "  📹 1 MB video → +5 minutes\n\n"
+        "🚪 *Leave* — tap the Leave button to exit NightVi"
+    )
+    if is_adm:
+        text += (
+            "\n\n━━━━━━━━━━━━━━━━━\n"
+            "🛡 *Admin Commands*\n"
+            "`/admin` — admin panel\n"
+            "`/users` — user list\n"
+            "`/ban [reason]` — ban (reply to message)\n"
+            "`/unban` — unban user\n"
+            "`/mute 10min [reason]` — mute with duration\n"
+            "`/del 5sec` · `/del 2min` — schedule delete\n"
+            "`/delete` — delete one message (reply to it)\n"
+            "`/stats` — network stats\n"
+            "`/addadmin` — promote to admin (reply to message)\n"
+            "\n_Durations: `s` / `min` / `h` / `d`_"
+        )
+    return text
+
+
+# ── Low-time proactive notification ──────────────────────────────────────────
+
+_low_time_warned: set = set()   # uids already notified; cleared when they recharge
+
+
+def check_low_time_users():
+    """
+    Called from the maintenance loop every 5 min.
+    Proactively notifies users whose remaining time just dropped below LOW_TIME_WARN.
+    """
+    from config import LOW_TIME_WARN
+    try:
+        users = active_users()
+        for u in users:
+            uid = u["user_id"]
+            if u["role"] >= 1:   # admins have unlimited time
+                _low_time_warned.discard(uid)
+                continue
+            secs = _row_access_secs(u)
+            if 0 < secs < LOW_TIME_WARN:
+                if uid not in _low_time_warned:
+                    _low_time_warned.add(uid)
+                    _safe(bot.send_message, uid,
+                          f"⚠️ *Low time warning!*\n\n"
+                          f"Only *{fmt_time(secs)}* remaining on NightVi.\n"
+                          f"`{time_bar(secs)}`\n\n"
+                          f"📸 Photo → +1 min  ·  📹 1 MB video → +5 min\n"
+                          f"🔗 Or invite a friend with your referral link for +2h",
+                          parse_mode="Markdown",
+                          reply_markup=user_main_keyboard(),
+                          target_uid=uid)
+            elif secs >= LOW_TIME_WARN:
+                _low_time_warned.discard(uid)   # recharged — allow future warnings
+    except Exception as e:
+        log.warning("check_low_time_users error: %s", e)
+
+
+# ── /id ───────────────────────────────────────────────────────────────────
+
+def cmd_id(msg: types.Message):
+    row = get_user(msg.from_user.id)
+    if not row or not row["active"]:
+        bot.reply_to(msg, "You're not in the network. Send /start to join.")
+        return
+    name = row["display_name"] or row["random_id"]
+    secs = get_access_seconds(msg.from_user.id) if row["role"] == 0 else -1
+    time_info = (
+        f"\n⏱ Time: *{fmt_time(secs)}*\n`{time_bar(secs)}`"
+        if secs >= 0 else "\n🛡 Access: Unlimited"
+    )
+    bot.reply_to(msg,
+        f"🆔 ID: `{row['random_id']}`\n"
+        f"📛 Name: *{md(name)}*\n"
+        f"👥 Members: {user_count()}{time_info}",
+        parse_mode="Markdown",
+    )
+
+
+# ── /referral ─────────────────────────────────────────────────────────────
+
+def cmd_referral(msg: types.Message):
+    uid = msg.from_user.id
+    row = get_user(uid)
+    if not row or not row["active"]:
+        bot.reply_to(msg, "Join first with /start.")
+        return
+    code  = get_referral_code(uid)
+    if not code:
+        bot.reply_to(msg, "❌ Could not generate your referral link. Try again.")
+        return
+    ref_count = get_referral_count(uid)
+    me = bot.get_me()
+    link = f"https://t.me/{me.username}?start={code}"
+    text = (
+        "🔗 *Your Referral Link*\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
+        f"`{link}`\n\n"
+        f"🎁 *How it works:*\n"
+        f"  • Share your link with friends\n"
+        f"  • When they join using it, you *both* get +2 hours\n"
+        f"  • No limits on how many friends you can invite!\n\n"
+        f"📊 Successful referrals: *{ref_count}*\n"
+        f"⏰ Total earned: *{fmt_time(ref_count * REFERRAL_REWARD_SECS)}*"
+    )
+    bot.reply_to(msg, text, parse_mode="Markdown", reply_markup=referral_keyboard())
+
+
+# ── /leave ─────────────────────────────────────────────────────────────────
+
+def cmd_leave(msg: types.Message):
+    row = get_user(msg.from_user.id)
+    if not row or not row["active"]:
+        bot.reply_to(msg, "You're not in the network.")
+        return
+    deactivate_user(msg.from_user.id)
+    bot.reply_to(msg, "✅ You have left the network. Send /start to rejoin anytime.")
+    log.info("User %s left", msg.from_user.id)
+
+
+# ── /name ─────────────────────────────────────────────────────────────────
+
+def cmd_name(msg: types.Message):
+    row = get_user(msg.from_user.id)
+    if not row or not row["active"]:
+        bot.reply_to(msg, "Join first with /start.")
+        return
+    parts = msg.text.strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(msg, "Usage: `/name YourNewName`", parse_mode="Markdown")
+        return
+    name = parts[1].strip()[:32]
+    if set_display_name(msg.from_user.id, name):
+        bot.reply_to(msg, f"✅ Display name set to: *{md(name)}*", parse_mode="Markdown")
+    else:
+        bot.reply_to(msg, f"❌ The name '{name}' is already taken.")
+
+
+# ── /admin ─────────────────────────────────────────────────────────────────
+
+def cmd_admin(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        bot.reply_to(msg, "❌ You don't have admin access.")
+        return
+    bot.reply_to(msg, admin_panel_text(stats()),
+                 parse_mode="Markdown",
+                 reply_markup=admin_keyboard(msg.from_user.id))
+
+
+# ── /users ─────────────────────────────────────────────────────────────────
+
+def cmd_users(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        bot.reply_to(msg, "❌ You don't have admin access.")
+        return
+    _, total = all_users_paged(0)
+    bot.reply_to(msg,
+        f"👥 *User List*\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        f"Total: *{total}* members\n\n"
+        f"🟢 Active  🔴 Banned  💤 Inactive  🛡️ Admin  👑 Main Admin",
+        parse_mode="Markdown",
+        reply_markup=users_keyboard(0),
+    )
+
+
+# ── /ban ──────────────────────────────────────────────────────────────────
+
+def cmd_ban(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        bot.reply_to(msg, "❌ You don't have admin access.")
+        return
+    if msg.reply_to_message:
+        row = get_batch_by_msg(msg.from_user.id, msg.reply_to_message.message_id)
+        if not row:
+            bot.reply_to(msg, "❌ Could not find the original sender. (Only works on relayed messages.)")
+            return
+        target_uid = row["sender_uid"]
+        if target_uid == MAIN_ADMIN_ID:
+            bot.reply_to(msg, "❌ Cannot ban the main admin.")
+            return
+        # Parse optional reason
+        parts  = msg.text.strip().split(maxsplit=1)
+        reason = parts[1].strip() if len(parts) > 1 else None
+        ban_user(target_uid)
+        u    = get_user(target_uid)
+        name = (u["display_name"] or u["random_id"]) if u else str(target_uid)
+        bot.reply_to(msg, f"✅ User *{md(name)}* has been banned.", parse_mode="Markdown")
+        # Notify banned user
+        threading.Thread(
+            target=_notify_banned, args=(target_uid, reason), daemon=True
+        ).start()
+        log.info("Admin %s banned user %s (reason=%s)", msg.from_user.id, target_uid, reason)
+    else:
+        _, total = all_users_paged(0)
+        bot.reply_to(msg,
+            f"👥 *Select a user to ban*\n━━━━━━━━━━━━━━━━━\nTotal: *{total}* members",
+            parse_mode="Markdown",
+            reply_markup=users_keyboard(0),
+        )
+
+
+# ── /unban ─────────────────────────────────────────────────────────────────
+
+def cmd_unban(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return
+    bot.reply_to(msg, "👥 *Select a user to unban:*",
+                 parse_mode="Markdown",
+                 reply_markup=banned_users_keyboard(0))
+
+
+# ── /mute ─────────────────────────────────────────────────────────────────
+
+def cmd_mute(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        bot.reply_to(msg, "❌ You don't have admin access.")
+        return
+    if not msg.reply_to_message:
+        bot.reply_to(msg,
+            "Reply to a relayed message with:\n"
+            "`/mute 10min` — mute for 10 minutes\n"
+            "`/mute 2h` — mute for 2 hours\n"
+            "`/mute 1d` — mute for 1 day\n"
+            "`/mute 30min Spamming` — mute with reason",
+            parse_mode="Markdown",
+        )
+        return
+    row = get_batch_by_msg(msg.from_user.id, msg.reply_to_message.message_id)
+    if not row:
+        bot.reply_to(msg, "❌ Could not find the original sender.")
+        return
+    target_uid = row["sender_uid"]
+    if target_uid == MAIN_ADMIN_ID:
+        bot.reply_to(msg, "❌ Cannot mute the main admin.")
+        return
+
+    # Parse: /mute [duration] [optional reason]
+    raw = msg.text.strip()
+    args_str = raw[len("/mute"):].strip()
+
+    # Try to extract duration from start of args
+    duration_secs = None
+    reason        = None
+    if args_str:
+        # Find first duration token
+        import re
+        m = re.match(
+            r"(\d+(?:\.\d+)?\s*(?:s|sec|secs|second|seconds"
+            r"|m|min|mins|minute|minutes"
+            r"|h|hr|hrs|hour|hours"
+            r"|d|day|days))\s*(.*)?",
+            args_str, re.IGNORECASE
+        )
+        if m:
+            duration_secs = parse_duration(m.group(1))
+            reason        = m.group(2).strip() or None
+        else:
+            # No valid duration — show usage
+            bot.reply_to(msg,
+                "❌ Invalid duration.\n"
+                "Examples: `/mute 10min`, `/mute 2h`, `/mute 1d`, `/mute 30min Spamming`",
+                parse_mode="Markdown",
+            )
+            return
+    else:
+        duration_secs = MUTE_SECONDS  # default 5 min
+
+    if not duration_secs or duration_secs <= 0:
+        bot.reply_to(msg, "❌ Duration must be greater than 0.")
+        return
+
+    set_mute(target_uid, duration_secs)
+    u    = get_user(target_uid)
+    name = (u["display_name"] or u["random_id"]) if u else str(target_uid)
+    dur_str = fmt_time(duration_secs)
+    reply_text = f"🔇 User *{md(name)}* muted for *{dur_str}*"
+    if reason:
+        reply_text += f"\n📝 Reason: _{md(reason)}_"
+    bot.reply_to(msg, reply_text, parse_mode="Markdown")
+
+    # Notify the muted user via PM
+    threading.Thread(
+        target=_notify_muted, args=(target_uid, duration_secs, reason), daemon=True
+    ).start()
+    log.info("Admin %s muted user %s for %ss (reason=%s)",
+             msg.from_user.id, target_uid, duration_secs, reason)
+
+
+# ── /addadmin ─────────────────────────────────────────────────────────────
+
+def cmd_addadmin(msg: types.Message):
+    if not is_main_admin(msg.from_user.id):
+        bot.reply_to(msg, "❌ Only the main admin can add admins.")
+        return
+    if msg.reply_to_message:
+        row = get_batch_by_msg(msg.from_user.id, msg.reply_to_message.message_id)
+        if not row:
+            bot.reply_to(msg, "❌ Reply to a relayed message to promote its sender.")
+            return
+        target_uid = row["sender_uid"]
+        u = get_user(target_uid)
+        if not u:
+            bot.reply_to(msg, "❌ User not found.")
+            return
+        set_role(target_uid, 1)
+        name = u["display_name"] or u["random_id"]
+        bot.reply_to(msg, f"✅ *{md(name)}* is now an admin.", parse_mode="Markdown")
+    else:
+        bot.reply_to(msg,
+            "Reply to a relayed message with /addadmin to promote that user to admin.")
+
+
+# ── /del ──────────────────────────────────────────────────────────────────
+
+def cmd_del(msg: types.Message):
+    global _del_running
+    if not is_admin(msg.from_user.id):
+        bot.reply_to(msg, "❌ You don't have admin access.")
+        return
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) == 2:
+        countdown = parse_del_time(parts[1])
+        if countdown is None or countdown <= 0:
+            bot.reply_to(msg,
+                "❌ Invalid time format. Examples:\n"
+                "`/del 5sec` — 5 seconds\n"
+                "`/del 2min` — 2 minutes\n"
+                "`/del 30s` — 30 seconds",
+                parse_mode="Markdown",
+            )
+            return
+    else:
+        countdown = DEL_COUNTDOWN
+
+    with _del_lock:
+        if _del_running:
+            bot.reply_to(msg, "⏳ A deletion is already scheduled. Please wait.")
+            return
+        _del_running = True
+        _del_cancel_evt.clear()   # reset any previous cancel signal
+
+    started  = False
+    mins     = countdown // 60
+    secs_rem = countdown % 60
+    time_str = (
+        f"{mins}m {secs_rem}s" if secs_rem
+        else (f"{mins} min" if mins else f"{countdown}s")
+    )
+    notice = (
+        f"⚠️ *Warning:* Save any media — all messages will be deleted in {time_str}."
+        if countdown > 300
+        else f"🗑 All messages will be deleted in {time_str}."
+    )
+    for u in active_users():
+        _safe(bot.send_message, u["user_id"], notice,
+              parse_mode="Markdown", target_uid=u["user_id"])
+    bot.reply_to(msg, f"✅ All users notified. Deletion starts in {time_str}.")
+    log.info("Admin %s triggered /del (countdown=%ss)", msg.from_user.id, countdown)
+
+    def _do_delete():
+        global _del_running
+        try:
+            cancelled = _del_cancel_evt.wait(timeout=countdown)
+            if cancelled:
+                log.info("/del cancelled by admin before deletion started")
+                return
+            rows = get_all_relay_msgs()
+            for row in rows:
+                _safe(bot.delete_message, row["target_uid"], row["message_id"])
+                time.sleep(0.03)
+            delete_relay_log_all()
+            log.info("/del completed — %d messages deleted", len(rows))
+        except Exception as e:
+            log.error("/del thread error: %s", e, exc_info=True)
+        finally:
+            with _del_lock:
+                _del_running = False
+
+    try:
+        threading.Thread(target=_do_delete, daemon=True).start()
+        started = True
+    finally:
+        if not started:
+            with _del_lock:
+                _del_running = False
+
+
+# ── /cancelDel ────────────────────────────────────────────────────────────
+
+def cmd_cancel_del(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        bot.reply_to(msg, "❌ You don't have admin access.")
+        return
+    with _del_lock:
+        if not _del_running:
+            bot.reply_to(msg, "ℹ️ No deletion is currently scheduled.")
+            return
+    _del_cancel_evt.set()   # wake the sleeping thread → it will abort
+    bot.reply_to(msg, "✅ Deletion cancelled.")
+    cancel_notice = "✅ *Deletion cancelled.* Messages are safe."
+    for u in active_users():
+        _safe(bot.send_message, u["user_id"], cancel_notice,
+              parse_mode="Markdown", target_uid=u["user_id"])
+    log.info("Admin %s cancelled pending /del", msg.from_user.id)
+
+
+# ── /delete ───────────────────────────────────────────────────────────────
+
+def cmd_delete(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        bot.reply_to(msg, "❌ You don't have admin access.")
+        return
+    if not msg.reply_to_message:
+        bot.reply_to(msg, "Reply to a relayed message with /delete to remove it from all chats.")
+        return
+    row = get_batch_by_msg(msg.from_user.id, msg.reply_to_message.message_id)
+    if not row:
+        bot.reply_to(msg, "❌ Message not found in relay log.")
+        return
+    batch_id = row["batch_id"]
+    msgs_    = get_batch_msgs(batch_id)
+    for m in msgs_:
+        _safe(bot.delete_message, m["target_uid"], m["message_id"])
+        time.sleep(0.02)
+    delete_relay_log_batch(batch_id)
+    bot.reply_to(msg, f"✅ Deleted from {len(msgs_)} chat(s).")
+    log.info("Admin %s deleted batch %s (%d msgs)", msg.from_user.id, batch_id, len(msgs_))
+
+
+# ── /stats ─────────────────────────────────────────────────────────────────
+
+def cmd_stats(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return
+    bot.reply_to(msg, admin_panel_text(stats()), parse_mode="Markdown")
+
+
+# ── Unknown command ────────────────────────────────────────────────────────
+
+def cmd_unknown(msg: types.Message):
+    bot.reply_to(msg, "❓ Unknown command. Use /help for the list of commands.")
+
+
+# ── Callback handler ───────────────────────────────────────────────────────
+
+def on_callback(call: types.CallbackQuery):
+    uid  = call.from_user.id
+    data = call.data
+
+    if data == "noop":
+        bot.answer_callback_query(call.id)
+        return
+
+    # ── Time balance ────────────────────────────────────────────────────────
+    if data in ("time:check", "time:refresh"):
+        if is_admin(uid):
+            text  = "🛡 *Unlimited Access*\nYou are an admin — no time restrictions."
+            kb    = None
+        else:
+            secs = get_access_seconds(uid)
+            if secs > 0:
+                warn = (
+                    "\n\n⚠️ *Running low!* Send a photo or video to top up."
+                    if secs < LOW_TIME_WARN else ""
+                )
+                text = (
+                    "🔮 *Time Balance*\n"
+                    "━━━━━━━━━━━━━━━━━\n\n"
+                    f"⏱ Remaining: *{fmt_time(secs)}*\n"
+                    f"`{time_bar(secs)}`{warn}\n\n"
+                    "📸 Photo = +1 min  |  📹 1 MB video = +5 min\n"
+                    "🔗 Invite friends for +2h each"
+                )
+            else:
+                text = (
+                    "❌ *No time remaining!*\n"
+                    "━━━━━━━━━━━━━━━━━\n\n"
+                    "📸 Photo = +1 min  |  📹 1 MB video = +5 min\n"
+                    "🔗 Use /referral to invite friends for +2h"
+                )
+            kb = user_time_keyboard_refresh()
+        try:
+            bot.edit_message_text(text, call.message.chat.id,
+                                  call.message.message_id,
+                                  parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            bot.send_message(uid, text, parse_mode="Markdown", reply_markup=kb)
+        bot.answer_callback_query(call.id)
+        return
+
+    if data == "time:howto":
+        bot.answer_callback_query(
+            call.id,
+            "📸 Photo = +1 min\n📹 1 MB video = +5 min\n🔗 Referral = +2h for both",
+            show_alert=True,
+        )
+        return
+
+    # ── Referral ────────────────────────────────────────────────────────────
+    if data in ("ref:link", "ref:stats"):
+        row = get_user(uid)
+        if not row:
+            bot.answer_callback_query(call.id, "Please /start first."); return
+        code      = get_referral_code(uid)
+        ref_count = get_referral_count(uid)
+        me   = bot.get_me()
+        link = f"https://t.me/{me.username}?start={code}"
+        text = (
+            "🔗 *Your Referral Link*\n"
+            "━━━━━━━━━━━━━━━━━\n\n"
+            f"`{link}`\n\n"
+            f"📊 Successful referrals: *{ref_count}*\n"
+            f"⏰ Total earned: *{fmt_time(ref_count * REFERRAL_REWARD_SECS)}*\n\n"
+            "Share the link — you *both* get +2h when someone joins!"
+        )
+        try:
+            bot.edit_message_text(text, call.message.chat.id,
+                                  call.message.message_id,
+                                  parse_mode="Markdown", reply_markup=referral_keyboard())
+        except Exception:
+            bot.send_message(uid, text, parse_mode="Markdown", reply_markup=referral_keyboard())
+        bot.answer_callback_query(call.id)
+        return
+
+    # ── Admin back / refresh ────────────────────────────────────────────────
+    if data == "admin:back":
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Access denied"); return
+        try:
+            bot.edit_message_text(
+                admin_panel_text(stats()),
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown", reply_markup=admin_keyboard(uid),
+            )
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
+        return
+
+    if data == "admin:stats":
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Access denied"); return
+        back_kb = types.InlineKeyboardMarkup()
+        back_kb.add(types.InlineKeyboardButton("🔙 Back", callback_data="admin:back"))
+        try:
+            bot.edit_message_text(
+                admin_panel_text(stats()),
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown", reply_markup=back_kb,
+            )
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
+        return
+
+    # ── Admin: backups ──────────────────────────────────────────────────────
+    if data == "admin:backups":
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Access denied"); return
+        from database import _db_op
+        total_b = _db_op(lambda c: c.execute("SELECT COUNT(*) FROM media_backup").fetchone()[0])
+        by_type = _db_op(lambda c: c.execute(
+            "SELECT file_type, COUNT(*) as cnt, SUM(file_size) as total_size "
+            "FROM media_backup GROUP BY file_type ORDER BY cnt DESC"
+        ).fetchall())
+        lines = [f"💾 *Media Backup Stats*\n━━━━━━━━━━━━━━━━━\n\nTotal: *{total_b}* files\n"]
+        for r in by_type:
+            sz_mb = (r["total_size"] or 0) / 1_048_576
+            lines.append(f"  • {r['file_type']}: *{r['cnt']}* ({sz_mb:.1f} MB)")
+        text = "\n".join(lines)
+        try:
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                                  parse_mode="Markdown", reply_markup=backups_keyboard())
+        except Exception:
+            bot.send_message(uid, text, parse_mode="Markdown", reply_markup=backups_keyboard())
+        bot.answer_callback_query(call.id)
+        return
+
+    # ── Users list ──────────────────────────────────────────────────────────
+    if data.startswith("admin:users:"):
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Access denied"); return
+        try:
+            page = int(data.split(":")[-1])
+        except ValueError:
+            bot.answer_callback_query(call.id); return
+        _, total = all_users_paged(page)
+        try:
+            bot.edit_message_text(
+                f"👥 *User List*\n━━━━━━━━━━━━━━━━━\nTotal: *{total}* members",
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown", reply_markup=users_keyboard(page),
+            )
+        except Exception as e:
+            log.error("admin:users edit failed: %s", e)
+        bot.answer_callback_query(call.id)
+        return
+
+    # ── User info ───────────────────────────────────────────────────────────
+    if data.startswith("admin:userinfo:"):
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Access denied"); return
+        try:
+            target = int(data.split(":")[-1])
+        except ValueError:
+            bot.answer_callback_query(call.id); return
+        u = get_user(target)
+        if not u:
+            bot.answer_callback_query(call.id, "User not found"); return
+        ref_count   = get_referral_count(target)
+        media_count = get_user_media_count(target)
+        try:
+            bot.edit_message_text(
+                user_info_text(u, ref_count, media_count),
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown", reply_markup=user_action_keyboard(target),
+            )
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
+        return
+
+    # ── Ban ─────────────────────────────────────────────────────────────────
+    if data.startswith("admin:ban:"):
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Access denied"); return
+        try:
+            target = int(data.split(":")[-1])
+        except ValueError:
+            bot.answer_callback_query(call.id); return
+        if target == MAIN_ADMIN_ID:
+            bot.answer_callback_query(call.id, "Cannot ban the main admin"); return
+        ban_user(target)
+        u    = get_user(target)
+        name = (u["display_name"] or u["random_id"]) if u else str(target)
+        bot.answer_callback_query(call.id, f"🔴 {name} banned")
+        threading.Thread(target=_notify_banned, args=(target,), daemon=True).start()
+        ref_count   = get_referral_count(target)
+        media_count = get_user_media_count(target)
+        try:
+            bot.edit_message_text(
+                user_info_text(get_user(target), ref_count, media_count),
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown", reply_markup=user_action_keyboard(target),
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Unban ───────────────────────────────────────────────────────────────
+    if data.startswith("admin:unban:"):
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Access denied"); return
+        try:
+            target = int(data.split(":")[-1])
+        except ValueError:
+            bot.answer_callback_query(call.id); return
+        unban_user(target)
+        u    = get_user(target)
+        name = (u["display_name"] or u["random_id"]) if u else str(target)
+        bot.answer_callback_query(call.id, f"🟢 {name} unbanned")
+        threading.Thread(target=_notify_unbanned, args=(target,), daemon=True).start()
+        ref_count   = get_referral_count(target)
+        media_count = get_user_media_count(target)
+        try:
+            bot.edit_message_text(
+                user_info_text(get_user(target), ref_count, media_count),
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown", reply_markup=user_action_keyboard(target),
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Mute (quick, default 5 min) ─────────────────────────────────────────
+    if data.startswith("admin:mute:") and not data.startswith("admin:mutefor:"):
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Access denied"); return
+        try:
+            target = int(data.split(":")[-1])
+        except ValueError:
+            bot.answer_callback_query(call.id); return
+        set_mute(target, MUTE_SECONDS)
+        u    = get_user(target)
+        name = (u["display_name"] or u["random_id"]) if u else str(target)
+        bot.answer_callback_query(call.id, f"🔇 {name} muted for 5 min")
+        threading.Thread(
+            target=_notify_muted, args=(target, MUTE_SECONDS, None), daemon=True
+        ).start()
+        ref_count   = get_referral_count(target)
+        media_count = get_user_media_count(target)
+        try:
+            bot.edit_message_text(
+                user_info_text(get_user(target), ref_count, media_count),
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown", reply_markup=user_action_keyboard(target),
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Mute for specific duration ───────────────────────────────────────────
+    if data.startswith("admin:mutefor:"):
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Access denied"); return
+        try:
+            parts_   = data.split(":")
+            target   = int(parts_[2])
+            duration = int(parts_[3])
+        except (ValueError, IndexError):
+            bot.answer_callback_query(call.id); return
+        set_mute(target, duration)
+        u    = get_user(target)
+        name = (u["display_name"] or u["random_id"]) if u else str(target)
+        bot.answer_callback_query(call.id, f"🔇 {name} muted for {fmt_time(duration)}")
+        threading.Thread(
+            target=_notify_muted, args=(target, duration, None), daemon=True
+        ).start()
+        ref_count   = get_referral_count(target)
+        media_count = get_user_media_count(target)
+        try:
+            bot.edit_message_text(
+                user_info_text(get_user(target), ref_count, media_count),
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown", reply_markup=user_action_keyboard(target),
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Unmute ──────────────────────────────────────────────────────────────
+    if data.startswith("admin:unmute:"):
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Access denied"); return
+        try:
+            target = int(data.split(":")[-1])
+        except ValueError:
+            bot.answer_callback_query(call.id); return
+        clear_mute(target)
+        u    = get_user(target)
+        name = (u["display_name"] or u["random_id"]) if u else str(target)
+        bot.answer_callback_query(call.id, f"🔊 {name} unmuted")
+        threading.Thread(target=_notify_unmuted, args=(target,), daemon=True).start()
+        ref_count   = get_referral_count(target)
+        media_count = get_user_media_count(target)
+        try:
+            bot.edit_message_text(
+                user_info_text(get_user(target), ref_count, media_count),
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown", reply_markup=user_action_keyboard(target),
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Add time ────────────────────────────────────────────────────────────
+    if data.startswith("admin:addtime:"):
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Access denied"); return
+        try:
+            parts_  = data.split(":")
+            target  = int(parts_[2])
+            seconds = int(parts_[3])
+        except (ValueError, IndexError):
+            bot.answer_callback_query(call.id); return
+        add_access_time(target, seconds)
+        u    = get_user(target)
+        name = (u["display_name"] or u["random_id"]) if u else str(target)
+        bot.answer_callback_query(call.id, f"⏰ +{fmt_time(seconds)} added to {name}")
+        # Notify the recipient
+        new_secs = get_access_seconds(target)
+        threading.Thread(
+            target=_safe,
+            args=(bot.send_message, target),
+            kwargs=dict(
+                text=(
+                    f"⏰ *Time Added!*\n"
+                    f"━━━━━━━━━━━━━━━━━\n\n"
+                    f"An admin granted you *+{fmt_time(seconds)}* of access.\n"
+                    f"Your new balance: *{fmt_time(new_secs)}*\n"
+                    f"`{time_bar(new_secs)}`"
+                ),
+                parse_mode="Markdown",
+                target_uid=target,
+            ),
+            daemon=True,
+        ).start()
+        ref_count   = get_referral_count(target)
+        media_count = get_user_media_count(target)
+        try:
+            bot.edit_message_text(
+                user_info_text(get_user(target), ref_count, media_count),
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown", reply_markup=user_action_keyboard(target),
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Banned list ─────────────────────────────────────────────────────────
+    if data == "admin:banned":
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Access denied"); return
+        try:
+            bot.edit_message_text(
+                "🔴 *Banned Users*\n━━━━━━━━━━━━━━━━━",
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown", reply_markup=banned_users_keyboard(0),
+            )
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
+        return
+
+    if data.startswith("admin:banned_page:"):
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Access denied"); return
+        try:
+            page = int(data.split(":")[-1])
+        except ValueError:
+            bot.answer_callback_query(call.id); return
+        try:
+            bot.edit_message_text(
+                "🔴 *Banned Users*\n━━━━━━━━━━━━━━━━━",
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown", reply_markup=banned_users_keyboard(page),
+            )
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
+        return
+
+    # ── Muted list ──────────────────────────────────────────────────────────
+    if data == "admin:muted":
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Access denied"); return
+        from database import _db_op, _now
+        now_str = _now()
+        rows = _db_op(lambda c: c.execute(
+            "SELECT * FROM users WHERE muted_until IS NOT NULL AND muted_until > ?",
+            (now_str,)
+        ).fetchall())
+        if not rows:
+            bot.answer_callback_query(call.id, "No muted users right now.", show_alert=True)
+            return
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        for u in rows:
+            name = u["display_name"] or u["random_id"]
+            remaining = mute_remaining_secs(u["user_id"])
+            kb.add(types.InlineKeyboardButton(
+                f"🔇 {name}  ·  {fmt_time(remaining)} left",
+                callback_data=f"admin:userinfo:{u['user_id']}",
+            ))
+        kb.add(types.InlineKeyboardButton("🔙 Back", callback_data="admin:back"))
+        try:
+            bot.edit_message_text(
+                f"🔇 *Muted Users* ({len(rows)} total)\n━━━━━━━━━━━━━━━━━",
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown", reply_markup=kb,
+            )
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
+        return
+
+    # ── Add admin ───────────────────────────────────────────────────────────
+    if data == "admin:addadmin":
+        if not is_main_admin(uid):
+            bot.answer_callback_query(call.id, "Main admin only"); return
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            uid,
+            "Reply to any relayed message with /addadmin to promote that user to admin.",
+        )
+        return
+
+    # ── Media settings ──────────────────────────────────────────────────────
+    if data == "media:show":
+        if not is_main_admin(uid):
+            bot.answer_callback_query(call.id, "Main admin only"); return
+        ms = get_media_settings()
+        try:
+            bot.edit_message_text(
+                media_settings_text(ms), call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown", reply_markup=media_keyboard(ms),
+            )
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
+        return
+
+    if data.startswith("media:toggle:"):
+        if not is_main_admin(uid):
+            bot.answer_callback_query(call.id, "Main admin only"); return
+        field = data.split(":")[-1]
+        ms    = get_media_settings()
+        set_media_field(field, 0 if ms.get(field) else 1)
+        ms = get_media_settings()
+        try:
+            bot.edit_message_text(
+                media_settings_text(ms), call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown", reply_markup=media_keyboard(ms),
+            )
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
+        return
+
+    if data.startswith("media:setsize:"):
+        if not is_main_admin(uid):
+            bot.answer_callback_query(call.id, "Main admin only"); return
+        which = data.split(":")[-1]
+        with _awaiting_lock:
+            _awaiting[uid] = {"action": f"video_{which}"}
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            uid,
+            f"Send the {'minimum' if which == 'min' else 'maximum'} video size in MB "
+            f"(e.g. `5` for 5 MB). Send `0` to remove the limit.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # ── User main menu ───────────────────────────────────────────────────────
+    if data == "user:menu":
+        row = get_user(uid)
+        if not row:
+            bot.answer_callback_query(call.id, "Please /start first."); return
+        n    = user_count()
+        secs = get_access_seconds(uid) if row["role"] == 0 else -1
+        if is_admin(uid):
+            time_line = "🛡 Admin — unlimited access"
+            kb        = admin_keyboard(uid)
+        elif secs > 0:
+            time_line = f"⏳ Time balance: *{fmt_time(secs)}*\n`{time_bar(secs)}`"
+            kb        = user_main_keyboard()
+        else:
+            time_line = "⏳ Time balance: *0 min* — send media to earn time"
+            kb        = user_main_keyboard()
+        text = (
+            f"✦ *NightVi*\n"
+            f"━━━━━━━━━━━━━━━━━\n\n"
+            f"🆔 Your ID: `{row['random_id']}`\n"
+            f"👥 Members: *{n}*\n"
+            f"{time_line}\n\n"
+            f"📨 Every message is delivered anonymously.\n"
+            f"📸 Photo → *+1 min*  ·  📹 1 MB video → *+5 min*"
+        )
+        try:
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                                  parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            bot.send_message(uid, text, parse_mode="Markdown", reply_markup=kb)
+        bot.answer_callback_query(call.id)
+        return
+
+    # ── Profile view ─────────────────────────────────────────────────────────
+    if data == "profile:show":
+        row = get_user(uid)
+        if not row:
+            bot.answer_callback_query(call.id, "Please /start first."); return
+        name = row["display_name"] or row["random_id"]
+        secs = get_access_seconds(uid) if row["role"] == 0 else -1
+        ref_count = get_referral_count(uid)
+        if secs >= 0:
+            time_line = f"⏱ *{fmt_time(secs)}* remaining\n`{time_bar(secs)}`"
+        else:
+            time_line = "🛡 Unlimited (Admin)"
+        text = (
+            f"👤 *Profile*\n"
+            f"━━━━━━━━━━━━━━━━━\n\n"
+            f"🆔 ID: `{row['random_id']}`\n"
+            f"📛 Name: *{md(name)}*\n\n"
+            f"{time_line}\n\n"
+            f"🔗 Referrals: *{ref_count}* invited\n\n"
+            f"_To change your name, tap the button below._"
+        )
+        try:
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                                  parse_mode="Markdown", reply_markup=profile_keyboard())
+        except Exception:
+            bot.send_message(uid, text, parse_mode="Markdown", reply_markup=profile_keyboard())
+        bot.answer_callback_query(call.id)
+        return
+
+    if data == "profile:setname":
+        with _awaiting_lock:
+            _awaiting[uid] = {"action": "set_name"}
+        bot.answer_callback_query(call.id)
+        bot.send_message(uid,
+            "✏️ *Set Display Name*\n"
+            "━━━━━━━━━━━━━━━━━\n\n"
+            "Just type and send your new display name:\n"
+            "_Max 32 characters. Must be unique._",
+            parse_mode="Markdown",
+        )
+        return
+
+    # ── Leave network (with confirmation) ────────────────────────────────────
+    if data == "user:leave":
+        row = get_user(uid)
+        if not row or not row["active"]:
+            bot.answer_callback_query(call.id, "You're not in the network."); return
+        text = (
+            "🚪 *Leave NightVi?*\n"
+            "━━━━━━━━━━━━━━━━━\n\n"
+            "Your messages will no longer be relayed.\n"
+            "You can rejoin anytime with /start."
+        )
+        try:
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                                  parse_mode="Markdown", reply_markup=leave_confirm_keyboard())
+        except Exception:
+            bot.send_message(uid, text, parse_mode="Markdown",
+                             reply_markup=leave_confirm_keyboard())
+        bot.answer_callback_query(call.id)
+        return
+
+    if data == "user:leave_confirm":
+        row = get_user(uid)
+        if not row or not row["active"]:
+            bot.answer_callback_query(call.id, "You're not in the network."); return
+        deactivate_user(uid)
+        text = "✅ *You've left NightVi.*\n\nSend /start anytime to rejoin."
+        try:
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                                  parse_mode="Markdown")
+        except Exception:
+            bot.send_message(uid, text, parse_mode="Markdown")
+        bot.answer_callback_query(call.id, "You have left NightVi.")
+        log.info("User %s left via button", uid)
+        return
+
+    # ── Help (inline) ────────────────────────────────────────────────────────
+    if data == "user:help":
+        back_kb = types.InlineKeyboardMarkup()
+        back_kb.add(types.InlineKeyboardButton("🔙   Back to Menu", callback_data="user:menu"))
+        try:
+            bot.edit_message_text(
+                _help_text(is_admin(uid)),
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown", reply_markup=back_kb,
+            )
+        except Exception:
+            bot.send_message(uid, _help_text(is_admin(uid)), parse_mode="Markdown",
+                             reply_markup=back_kb)
+        bot.answer_callback_query(call.id)
+        return
+
+    bot.answer_callback_query(call.id)
+
+
+# ── Main message handler ───────────────────────────────────────────────────
+
+def handle_message(msg: types.Message):
+    uid = msg.from_user.id if msg.from_user else None
+    if not uid:
+        return
+    if msg.text and msg.text.startswith("/"):
+        return
+
+    row = get_user(uid)
+
+    # ── Awaiting input (admin video size setting) ────────────────────────────
+    with _awaiting_lock:
+        aw = _awaiting.pop(uid, None) if msg.text else None
+    if aw is not None:
+        if aw["action"] == "set_name":
+            name = (msg.text or "").strip()[:32]
+            if not name:
+                bot.reply_to(msg, "❌ Name cannot be empty. Try again.")
+            elif set_display_name(uid, name):
+                bot.reply_to(msg, f"✅ Display name set to *{md(name)}*",
+                             parse_mode="Markdown")
+            else:
+                bot.reply_to(msg,
+                    f"❌ The name *{md(name)}* is already taken. Try a different name.",
+                    parse_mode="Markdown")
+        else:
+            try:
+                mb    = float(msg.text.strip())
+                field = "min_video_bytes" if aw["action"] == "video_min" else "max_video_bytes"
+                set_media_field(field, int(mb * 1048576))
+                label = "minimum" if aw["action"] == "video_min" else "maximum"
+                bot.reply_to(msg,
+                    f"✅ Video {label} size set to {mb:.0f} MB."
+                    if mb > 0 else
+                    f"✅ Video {label} size limit removed."
+                )
+            except ValueError:
+                bot.reply_to(msg, "❌ Please send a number (e.g. `5`).", parse_mode="Markdown")
+        return
+
+    if not row or not row["active"]:
+        bot.reply_to(msg, "You're not in the network. Send /start to join.")
+        return
+
+    if row["is_banned"]:
+        bot.reply_to(msg, "🚫 You are banned.")
+        return
+
+    if is_muted(uid):
+        remaining = mute_remaining_secs(uid)
+        if remaining > 0:
+            bot.reply_to(msg, f"🔇 You are muted. Unmute in: *{fmt_time(remaining)}*",
+                         parse_mode="Markdown")
+        return
+
+    if check_spam(uid):
+        set_mute(uid, MUTE_SECONDS)
+        bot.reply_to(msg, "⚠️ You're sending too fast. You have been muted for 5 minutes.")
+        return
+
+    touch_user(uid)
+
+    # ── Duplicate media check ────────────────────────────────────────────────
+    has_media = (msg.photo or msg.video or msg.document or msg.audio
+                 or msg.voice or msg.animation or msg.sticker or msg.video_note)
+    if has_media and is_duplicate_media(msg):
+        log.info("Duplicate media blocked from uid=%s", uid)
+        bot.reply_to(msg,
+            "⚠️ *Duplicate media*\n\n"
+            "This file was already sent previously and cannot be relayed again.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # ── Time-earning from photos ──────────────────────────────────────────────
+    if msg.photo and not is_admin(uid):
+        add_access_time(uid, PHOTO_REWARD_SECS)
+        remaining = get_access_seconds(uid)
+        bot.reply_to(msg,
+            f"📸 *+{fmt_time(PHOTO_REWARD_SECS)}* added!\n"
+            f"⏳ Balance: *{fmt_time(remaining)}*\n"
+            f"`{time_bar(remaining)}`",
+            parse_mode="Markdown",
+            reply_markup=user_time_keyboard_refresh(),
+        )
+
+    # ── Time-earning from videos ──────────────────────────────────────────────
+    elif msg.video and not is_admin(uid):
+        size_bytes  = msg.video.file_size or 0
+        mb          = size_bytes / BYTES_PER_MIN
+        earned_secs = int(mb * VIDEO_REWARD_PER_MB)
+        if earned_secs > 0:
+            add_access_time(uid, earned_secs)
+            remaining = get_access_seconds(uid)
+            bot.reply_to(msg,
+                f"📹 *+{fmt_time(earned_secs)}* added!\n"
+                f"⏳ Balance: *{fmt_time(remaining)}*\n"
+                f"`{time_bar(remaining)}`",
+                parse_mode="Markdown",
+                reply_markup=user_time_keyboard_refresh(),
+            )
+        else:
+            bot.reply_to(msg,
+                "ℹ️ Video too small to earn time.\nMinimum: 1 MB = 5 minutes.",
+                parse_mode="Markdown",
+            )
+
+    # ── Access check ──────────────────────────────────────────────────────────
+    if not is_admin(uid) and not has_access(uid):
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🔮 My Balance", callback_data="time:check"))
+        kb.add(types.InlineKeyboardButton("🔗 Get Referral Link", callback_data="ref:link"))
+        bot.reply_to(msg,
+            "❌ *Your access time has expired!*\n\n"
+            "📸 Photo → +1 min  |  📹 1 MB video → +5 min\n"
+            "🔗 Invite friends → +2h for both of you",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+        return
+
+    # ── Low time warning ──────────────────────────────────────────────────────
+    if not is_admin(uid) and not (msg.photo or msg.video):
+        secs = get_access_seconds(uid)
+        if 0 < secs < LOW_TIME_WARN:
+            bot.reply_to(msg,
+                f"⚠️ Only *{fmt_time(secs)}* left!\n"
+                f"`{time_bar(secs)}`\n"
+                "Send a photo or video to top up.",
+                parse_mode="Markdown",
+                reply_markup=user_time_keyboard_refresh(),
+            )
+
+    # ── Media policy ──────────────────────────────────────────────────────────
+    ms  = get_media_settings()
+    err = _check_media_allowed(msg, ms)
+    if err:
+        bot.reply_to(msg, f"❌ {err}")
+        return
+
+    # ── Automatic media backup (non-blocking) ─────────────────────────────────
+    if has_media:
+        backup_message_media(bot, msg, uid)
+
+    # ── Relay ─────────────────────────────────────────────────────────────────
+    target_count = len(active_users(exclude_id=uid))
+    threading.Thread(
+        target=relay_message,
+        args=(uid, msg.chat.id, msg),
+        daemon=True,
+    ).start()
+
+    # Confirmation for admins (regular users already see time-earn replies)
+    if is_admin(uid):
+        _safe(bot.reply_to, msg, f"✓ Relayed to *{target_count}* member(s).",
+              parse_mode="Markdown", target_uid=uid)
+
+
+# ── Media policy check ────────────────────────────────────────────────────
+
+def _check_media_allowed(message, ms):
+    if message.text:
+        return None if ms["allow_text"] else "Text messages are not allowed."
+    if message.photo:
+        return None if ms["allow_photo"] else "Photos are not allowed."
+    if message.animation:
+        return None if ms["allow_animation"] else "GIFs are not allowed."
+    if message.sticker:
+        return None if ms["allow_sticker"] else "Stickers are not allowed."
+    if message.voice:
+        return None if ms["allow_voice"] else "Voice messages are not allowed."
+    if message.audio:
+        return None if ms["allow_audio"] else "Audio files are not allowed."
+    if message.document:
+        return None if ms["allow_document"] else "Files are not allowed."
+    if message.video:
+        if not ms["allow_video"]:
+            return "Videos are not allowed."
+        size   = message.video.file_size or 0
+        mn, mx = ms["min_video_bytes"], ms["max_video_bytes"]
+        if mn and size < mn:
+            return f"Video too small (min {mn // 1048576} MB)."
+        if mx and size > mx:
+            return f"Video too large (max {mx // 1048576} MB)."
+    return None
