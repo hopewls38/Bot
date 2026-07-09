@@ -937,8 +937,39 @@ def cmd_pin(msg: types.Message):
               disable_notification=True, target_uid=m["target_uid"])
 
     _parallel_dispatch(msgs_, _pin_one)
-    bot.reply_to(msg, f"📌 Pinned in {len(msgs_)} chat(s).")
-    log.info("Admin %s pinned batch %s (%d chats)", msg.from_user.id, batch_id, len(msgs_))
+
+    # Muted/expired users are excluded from normal relay/broadcast delivery,
+    # so they never got a copy of this message in the first place. When an
+    # admin pins something, deliver it to them too (from the admin's own
+    # copy) and pin it there — same batch_id, so /delete still cleans it up.
+    already  = {m["target_uid"] for m in msgs_}
+    already.add(msg.from_user.id)
+    src_chat = msg.from_user.id
+    src_mid  = msg.reply_to_message.message_id
+    missing  = [u for u in all_reachable_users()
+                if not u["is_banned"] and u["user_id"] not in already
+                and (_row_is_muted(u) or not _row_has_access(u))]
+
+    delivered = []
+
+    def _deliver_and_pin(u):
+        tid = u["user_id"]
+        m = _safe(bot.copy_message, chat_id=tid, from_chat_id=src_chat,
+                  message_id=src_mid, target_uid=tid)
+        if m and hasattr(m, "message_id"):
+            log_relay(batch_id, msg.from_user.id, tid, m.message_id)
+            _safe(bot.pin_chat_message, tid, m.message_id,
+                  disable_notification=True, target_uid=tid)
+            delivered.append(tid)
+
+    if missing:
+        _parallel_dispatch(missing, _deliver_and_pin)
+
+    total = len(msgs_) + len(delivered)
+    extra_note = f" (+{len(delivered)} muted/expired user(s) notified & pinned)" if delivered else ""
+    bot.reply_to(msg, f"📌 Pinned in {total} chat(s).{extra_note}")
+    log.info("Admin %s pinned batch %s (%d chats, %d extra muted/expired)",
+              msg.from_user.id, batch_id, len(msgs_), len(delivered))
 
 
 # ── /broadcast ────────────────────────────────────────────────────────────
@@ -970,10 +1001,15 @@ def _run_broadcast(admin_uid: int, body: str):
         # reachable user gets them regardless of ban/mute/expired status.
         # Relay/welcome-media eligibility rules don't apply here.
         targets = all_reachable_users()
+        batch   = str(uuid.uuid4())
 
         def _send_one(u):
-            _safe(bot.send_message, u["user_id"], text,
-                  target_uid=u["user_id"])
+            tid = u["user_id"]
+            m = _safe(bot.send_message, tid, text, target_uid=tid)
+            if m and hasattr(m, "message_id"):
+                # Log every delivered copy so /pin and /delete (which look
+                # messages up by batch) also work on broadcast announcements.
+                log_relay(batch, admin_uid, tid, m.message_id)
 
         _parallel_dispatch(targets, _send_one)
         _safe(bot.send_message, admin_uid,
