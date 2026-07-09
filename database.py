@@ -405,6 +405,29 @@ def active_users(exclude_id=None):
             conn.close()
 
 
+def all_reachable_users(exclude_id=None):
+    """
+    Every user we can still physically message — i.e. hasn't blocked/left the
+    bot (active=1). Unlike active_users(), this deliberately includes banned,
+    muted, and access-expired users: broadcasts are announcements from staff
+    and must reach everyone, regardless of their relay/media eligibility.
+    """
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            if exclude_id:
+                cur.execute(
+                    "SELECT * FROM users WHERE active=1 AND user_id!=%s",
+                    (exclude_id,),
+                )
+            else:
+                cur.execute("SELECT * FROM users WHERE active=1")
+            return cur.fetchall()
+        finally:
+            conn.close()
+
+
 def all_users_paged(page=0, per_page=6):
     with _db_lock:
         conn = _conn()
@@ -472,6 +495,44 @@ def add_access_time(uid, seconds: int):
                 "UPDATE users SET access_until=%s WHERE user_id=%s", (new_until, uid)
             )
             conn.commit()
+        finally:
+            conn.close()
+
+
+def add_access_time_returning_was_expired(uid, seconds: int) -> bool:
+    """
+    Same effect as add_access_time(uid, seconds), but does the "was this user
+    out of time?" check and the balance update inside one _db_lock-protected
+    transaction, so a "welcome back" greet can be dispatched exactly once per
+    genuine expired→active transition. Calling get_access_seconds(uid) and
+    add_access_time(uid, ...) as two separate locked calls (as the caller
+    used to) leaves a gap between them where a second concurrent message
+    from the same user could also read "expired" and double-fire the greet.
+    """
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT access_until FROM users WHERE user_id=%s", (uid,))
+            row = cur.fetchone()
+            now = datetime.now(timezone.utc)
+            base = now
+            was_expired = True
+            if row and row["access_until"]:
+                try:
+                    cur_t = datetime.fromisoformat(row["access_until"])
+                    if cur_t.tzinfo is None:
+                        cur_t = cur_t.replace(tzinfo=timezone.utc)
+                    was_expired = cur_t <= now
+                    base = max(now, cur_t)
+                except Exception:
+                    pass
+            new_until = (base + timedelta(seconds=seconds)).isoformat()
+            cur.execute(
+                "UPDATE users SET access_until=%s WHERE user_id=%s", (new_until, uid)
+            )
+            conn.commit()
+            return was_expired
         finally:
             conn.close()
 

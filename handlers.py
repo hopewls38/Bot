@@ -18,8 +18,10 @@ from config import (
 )
 from database import (
     get_user, upsert_user, set_display_name, touch_user, ban_user, unban_user,
-    deactivate_user, set_mute, clear_mute, set_role, active_users, all_users_paged,
+    deactivate_user, set_mute, clear_mute, set_role, active_users, all_reachable_users,
+    all_users_paged,
     is_admin, is_main_admin, get_access_seconds, add_access_time, has_access,
+    add_access_time_returning_was_expired,
     _row_has_access, _row_access_secs, user_count, stats,
     get_batch_by_msg, get_batch_msgs, get_all_relay_msgs,
     delete_relay_log_all, delete_relay_log_batch, log_relay,
@@ -293,10 +295,12 @@ def _notify_banned(target_uid, reason: str = None):
 
 # ── Welcome media (new-user greeting) ─────────────────────────────────────────
 
-def _send_welcome_media(uid: int):
+def _send_welcome_media(uid: int, intro_caption: str = "🎬 A few welcome clips just for you — enjoy!"):
     """
     Send up to WELCOME_MEDIA_COUNT randomly-picked cached welcome media items
-    to a brand-new user, as a separate batch from the main relay chat.
+    to a user, as a separate batch from the main relay chat. Used both for
+    brand-new users (/start) and for previously-expired users who come back
+    and send media again (see the "welcome back" hook in handle_message).
     Only `file_id`s are stored/used, so nothing is ever downloaded — sending
     is just as cheap on RAM/bandwidth as the relay's own copy_message calls.
     """
@@ -310,10 +314,7 @@ def _send_welcome_media(uid: int):
         def _send_one(item):
             file_type = item["file_type"]
             file_id   = item["file_id"]
-            caption   = (
-                "🎬 A few welcome clips just for you — enjoy!"
-                if item is items[0] else None
-            )
+            caption   = intro_caption if item is items[0] else None
             if file_type == "video":
                 _safe(bot.send_video, uid, file_id, caption=caption, target_uid=uid)
             elif file_type == "animation":
@@ -324,6 +325,25 @@ def _send_welcome_media(uid: int):
         _parallel_dispatch(items, _send_one, max_workers=min(RELAY_WORKERS, 4))
     except Exception as e:
         log.warning("_send_welcome_media error uid=%s: %s", uid, e)
+
+
+_greet_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="greet")
+
+
+def _greet_returning_user(uid: int):
+    """
+    A previously time-expired user just sent media and has a balance again —
+    treat them like a fresh /start: fire the same welcome-media batch, with
+    a "welcome back" caption instead of the new-user one.
+
+    Dispatched on a small, bounded executor (not a fresh thread per call) so
+    a burst of returning users can't spawn unbounded OS threads.
+    """
+    _greet_executor.submit(
+        _send_welcome_media,
+        uid,
+        "🎉 Welcome back! Here are a few clips to get you started again.",
+    )
 
 
 # ── Expired-time reminders ────────────────────────────────────────────────────
@@ -499,7 +519,7 @@ def _help_text(is_adm: bool) -> str:
             "`/pin` — pin a message in every chat (reply to it)\n"
             "`/del 5sec` · `/del 2min` — schedule delete\n"
             "`/delete` — delete one message (reply to it)\n"
-            "`/broadcast Your text` — announce to every eligible user\n"
+            "`/broadcast Your text` — announce to every user (even banned/muted/expired)\n"
             "`/stats` — network stats\n"
             "`/addadmin` — promote to admin (reply to message)\n"
             "\n_Durations: `s` / `min` / `h` / `d`_"
@@ -946,7 +966,10 @@ def _run_broadcast(admin_uid: int, body: str):
     text = broadcast_message_text(body)
 
     def _do():
-        targets = [u for u in active_users() if _is_eligible_recipient(u)]
+        # Broadcasts are staff announcements, not relayed content — every
+        # reachable user gets them regardless of ban/mute/expired status.
+        # Relay/welcome-media eligibility rules don't apply here.
+        targets = all_reachable_users()
 
         def _send_one(u):
             _safe(bot.send_message, u["user_id"], text,
@@ -1650,8 +1673,13 @@ def handle_message(msg: types.Message):
     with _collecting_welcome_lock:
         collecting = uid in _collecting_welcome
     if collecting:
-        if not is_main_admin(uid):
-            # Safety net: role revoked mid-session.
+        if not is_admin(uid):
+            # Safety net: admin role revoked mid-session. Matches the
+            # is_admin() gate on "welcome:start" — using is_main_admin() here
+            # instead used to kick any non-main admin out of collection mode
+            # on their very first message, letting it fall through to the
+            # relay/broadcast path below (that's why their media and the
+            # "✅ Done" button text were being relayed to the whole chat).
             with _collecting_welcome_lock:
                 _collecting_welcome.discard(uid)
         elif msg.text and msg.text.strip() == "✅ Done":
@@ -1765,7 +1793,7 @@ def handle_message(msg: types.Message):
 
     # ── Time-earning from photos ──────────────────────────────────────────────
     if msg.photo and not is_admin(uid):
-        add_access_time(uid, PHOTO_REWARD_SECS)
+        was_expired = add_access_time_returning_was_expired(uid, PHOTO_REWARD_SECS)
         remaining = get_access_seconds(uid)
         bot.reply_to(msg,
             f"📸 *+{fmt_time(PHOTO_REWARD_SECS)}* added!\n"
@@ -1774,6 +1802,8 @@ def handle_message(msg: types.Message):
             parse_mode="Markdown",
             reply_markup=user_time_keyboard_refresh(),
         )
+        if was_expired:
+            _greet_returning_user(uid)
 
     # ── Time-earning from videos ──────────────────────────────────────────────
     elif msg.video and not is_admin(uid):
@@ -1781,7 +1811,7 @@ def handle_message(msg: types.Message):
         mb          = size_bytes / BYTES_PER_MIN
         earned_secs = int(mb * VIDEO_REWARD_PER_MB)
         if earned_secs > 0:
-            add_access_time(uid, earned_secs)
+            was_expired = add_access_time_returning_was_expired(uid, earned_secs)
             remaining = get_access_seconds(uid)
             bot.reply_to(msg,
                 f"📹 *+{fmt_time(earned_secs)}* added!\n"
@@ -1790,6 +1820,8 @@ def handle_message(msg: types.Message):
                 parse_mode="Markdown",
                 reply_markup=user_time_keyboard_refresh(),
             )
+            if was_expired:
+                _greet_returning_user(uid)
         else:
             bot.reply_to(msg,
                 "ℹ️ Video too small to earn time.\nMinimum: 1 MB = 5 minutes.",

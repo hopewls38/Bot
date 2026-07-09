@@ -95,6 +95,11 @@ def _handle_shutdown(signum, frame):
         bot.stop_polling()
     except Exception:
         pass
+    try:
+        from handlers import _greet_executor
+        _greet_executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
