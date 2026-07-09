@@ -2,8 +2,10 @@
 
 import time
 import uuid
+import random
 import threading
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 from telebot import types
 
@@ -11,7 +13,8 @@ import telebot
 from config import (
     MAIN_ADMIN_ID, MUTE_SECONDS, DEL_COUNTDOWN, SPAM_WINDOW, SPAM_LIMIT,
     LOW_TIME_WARN, GRACE_SECONDS, PHOTO_REWARD_SECS, VIDEO_REWARD_PER_MB,
-    BYTES_PER_MIN, REFERRAL_REWARD_SECS,
+    BYTES_PER_MIN, REFERRAL_REWARD_SECS, WELCOME_MEDIA_COUNT, RELAY_WORKERS,
+    EXPIRED_REMINDER_INTERVAL_SECS,
 )
 from database import (
     get_user, upsert_user, set_display_name, touch_user, ban_user, unban_user,
@@ -20,19 +23,23 @@ from database import (
     _row_has_access, _row_access_secs, user_count, stats,
     get_batch_by_msg, get_batch_msgs, get_all_relay_msgs,
     delete_relay_log_all, delete_relay_log_batch, log_relay,
-    get_media_settings, set_media_field, is_muted, mute_remaining_secs,
+    get_media_settings, set_media_field, is_muted, _row_is_muted, mute_remaining_secs,
     get_referral_code, get_pending_referral, mark_referral_rewarded, get_referral_count,
-    get_user_media_count,
+    get_user_media_count, get_muted_users, get_backup_stats,
+    add_welcome_media, count_welcome_media, get_random_welcome_media,
+    get_users_needing_expired_reminder, mark_expired_reminder_sent,
 )
 from utils import (
     md, fmt_time, time_bar, parse_duration, parse_del_time,
     user_info_text, admin_panel_text, media_settings_text,
+    broadcast_message_text,
 )
 from keyboards import (
     user_time_keyboard, user_time_keyboard_refresh, admin_keyboard,
     users_keyboard, user_action_keyboard, banned_users_keyboard,
     media_keyboard, referral_keyboard, backups_keyboard,
     user_main_keyboard, profile_keyboard, leave_confirm_keyboard,
+    welcome_collect_keyboard, remove_keyboard,
 )
 from backup_manager import backup_message_media, is_duplicate_media
 
@@ -49,9 +56,14 @@ _del_running     = False
 _del_cancel_evt  = threading.Event()   # set() → cancels the pending deletion
 _shutdown   = threading.Event()
 
+# Admins currently in "collect welcome media" mode (in-memory, ephemeral).
+_collecting_welcome      = set()
+_collecting_welcome_lock = threading.Lock()
+
 _CAP_TYPES  = ("photo", "video", "animation", "audio", "document", "voice")
 _DEAD_ERRS  = ("bot was blocked", "user is deactivated", "chat not found",
                "forbidden", "have no rights")
+_WELCOME_MEDIA_TYPES = ("photo", "video", "animation")
 
 bot: telebot.TeleBot = None   # injected by main.py
 
@@ -59,8 +71,33 @@ bot: telebot.TeleBot = None   # injected by main.py
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _safe(fn, *args, target_uid=None, **kwargs):
+    """
+    Run a Telegram API call, transparently handling flood-control (429) with
+    a single retry, and auto-deactivating users whose chat has gone dead
+    (blocked/left/deleted) so future broadcasts skip them.
+    """
     try:
         return fn(*args, **kwargs)
+    except telebot.apihelper.ApiTelegramException as e:
+        if getattr(e, "error_code", None) == 429:
+            retry_after = 1
+            try:
+                retry_after = e.result_json.get("parameters", {}).get("retry_after", 1)
+            except Exception:
+                pass
+            time.sleep(retry_after + 0.2)
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e2:
+                e = e2
+        err = str(e).lower()
+        if any(x in err for x in _DEAD_ERRS):
+            if target_uid:
+                deactivate_user(target_uid)
+                log.info("Auto-deactivated %s: %s", target_uid, e)
+            return None
+        log.warning("Send error (uid=%s): %s", target_uid, e)
+        return None
     except Exception as e:
         err = str(e).lower()
         if any(x in err for x in _DEAD_ERRS):
@@ -70,6 +107,39 @@ def _safe(fn, *args, target_uid=None, **kwargs):
             return None
         log.warning("Send error (uid=%s): %s", target_uid, e)
         return None
+
+
+def _parallel_dispatch(items, worker_fn, max_workers=RELAY_WORKERS):
+    """
+    Run worker_fn(item) for every item concurrently instead of sequentially.
+    This is what makes broadcast/relay/welcome-media fan-out fast — no more
+    one-message-at-a-time-with-a-sleep. Exceptions in a worker are swallowed
+    (workers already use _safe internally) so one bad chat never stops the rest.
+    """
+    items = list(items)
+    if not items:
+        return
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(worker_fn, item) for item in items]
+        for f in futures:
+            try:
+                f.result()
+            except Exception as e:
+                log.warning("Parallel dispatch worker error: %s", e)
+
+
+def _is_eligible_recipient(user_row) -> bool:
+    """
+    True if a user should currently receive relayed/broadcast media —
+    banned, muted, or access-expired users are treated as if they left chat.
+    """
+    if not user_row or user_row["is_banned"] or not user_row["active"]:
+        return False
+    # Row-based check (no extra DB call per recipient) — matters when this
+    # runs across an entire relay/broadcast target list.
+    if _row_is_muted(user_row):
+        return False
+    return _row_has_access(user_row)
 
 
 def check_spam(uid) -> bool:
@@ -135,28 +205,38 @@ def _relay_to(source_chat_id, message, target_uid, prefix) -> list:
     return sent
 
 
-def relay_message(sender_uid, source_chat_id, message):
+def relay_message(sender_uid, source_chat_id, message, targets=None):
+    """
+    targets, if given, must already be filtered to eligible recipients
+    (see _is_eligible_recipient) — handle_message pre-computes this so the
+    "Relayed to N member(s)" confirmation always matches who actually got it.
+    If omitted, targets are looked up and filtered here instead.
+    """
     try:
         sender  = get_user(sender_uid)
         if sender is None:
             return
-        targets = active_users(exclude_id=sender_uid)
+        if targets is None:
+            targets = [t for t in active_users(exclude_id=sender_uid)
+                       if _is_eligible_recipient(t)]
         if not targets:
             return
         name   = sender["display_name"] or sender["random_id"]
         badge  = " 🛡" if sender["role"] >= 1 else ""
         prefix = f"📩 {name}{badge}\n\n"
         batch  = str(uuid.uuid4())
-        for t in targets:
+
+        def _send_one(t):
             if _shutdown.is_set():
-                break
-            tid = t["user_id"]
-            if not _row_has_access(t):
-                continue
+                return
+            tid  = t["user_id"]
             mids = _relay_to(source_chat_id, message, tid, prefix)
             for mid in mids:
                 log_relay(batch, sender_uid, tid, mid)
-            time.sleep(0.05)
+
+        # Fan the message out to every recipient concurrently instead of one
+        # at a time — this is the main relay speed-up.
+        _parallel_dispatch(targets, _send_one)
     except Exception as e:
         log.error("relay_message crashed (sender=%s): %s", sender_uid, e, exc_info=True)
 
@@ -209,6 +289,80 @@ def _notify_banned(target_uid, reason: str = None):
     text += "\nIf you believe this is a mistake, contact the admin."
     _safe(bot.send_message, target_uid, text, parse_mode="Markdown",
           target_uid=target_uid)
+
+
+# ── Welcome media (new-user greeting) ─────────────────────────────────────────
+
+def _send_welcome_media(uid: int):
+    """
+    Send up to WELCOME_MEDIA_COUNT randomly-picked cached welcome media items
+    to a brand-new user, as a separate batch from the main relay chat.
+    Only `file_id`s are stored/used, so nothing is ever downloaded — sending
+    is just as cheap on RAM/bandwidth as the relay's own copy_message calls.
+    """
+    try:
+        items = get_random_welcome_media(WELCOME_MEDIA_COUNT)
+        if not items:
+            return
+        items = list(items)
+        random.shuffle(items)
+
+        def _send_one(item):
+            file_type = item["file_type"]
+            file_id   = item["file_id"]
+            caption   = (
+                "🎬 A few welcome clips just for you — enjoy!"
+                if item is items[0] else None
+            )
+            if file_type == "video":
+                _safe(bot.send_video, uid, file_id, caption=caption, target_uid=uid)
+            elif file_type == "animation":
+                _safe(bot.send_animation, uid, file_id, caption=caption, target_uid=uid)
+            else:
+                _safe(bot.send_photo, uid, file_id, caption=caption, target_uid=uid)
+
+        _parallel_dispatch(items, _send_one, max_workers=min(RELAY_WORKERS, 4))
+    except Exception as e:
+        log.warning("_send_welcome_media error uid=%s: %s", uid, e)
+
+
+# ── Expired-time reminders ────────────────────────────────────────────────────
+
+def remind_expired_users():
+    """
+    DM every user whose access time has run out (and who hasn't already been
+    reminded within EXPIRED_REMINDER_INTERVAL_SECS) with a nudge on how to
+    earn more time. Called from main.py's maintenance loop roughly every 6h.
+    Banned/muted/admin users are never selected by the underlying query.
+    """
+    try:
+        rows = get_users_needing_expired_reminder(EXPIRED_REMINDER_INTERVAL_SECS)
+        if not rows:
+            return
+        text = (
+            "⏳ *Your access time has run out*\n"
+            "━━━━━━━━━━━━━━━━━\n\n"
+            "You can top up anytime:\n"
+            "📸 Photo → *+1 min*\n"
+            "📹 1 MB video → *+5 min*\n"
+            "🔗 Invite a friend → *+2h* for both of you\n\n"
+            "Just send a photo or video, or grab your referral link below."
+        )
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🔗 Get Referral Link", callback_data="ref:link"))
+
+        def _send_one(u):
+            tid = u["user_id"]
+            _safe(bot.send_message, tid, text, parse_mode="Markdown",
+                  reply_markup=kb, target_uid=tid)
+            # Marked as sent even on failure — a dead chat gets deactivated by
+            # _safe anyway, and we never want a retry storm on stale rows.
+            mark_expired_reminder_sent(tid)
+
+        _parallel_dispatch(rows, _send_one, max_workers=min(RELAY_WORKERS, 4))
+        log.info("Expired-time reminder sent to %d user(s)", len(rows))
+    except Exception as e:
+        log.warning("remind_expired_users error: %s", e)
 
 
 # ── Referral reward helper ────────────────────────────────────────────────────
@@ -265,10 +419,24 @@ def cmd_start(msg: types.Message):
         return
     touch_user(uid)
 
+    # Muted users can still browse but not send — tell them where they stand.
+    if is_muted(uid):
+        remaining = mute_remaining_secs(uid)
+        bot.reply_to(msg,
+            f"🔇 *You are muted*\n\n"
+            f"You can still browse, but sending is disabled for another "
+            f"*{fmt_time(remaining)}*.",
+            parse_mode="Markdown",
+        )
+
     # Grant referral rewards for brand-new users
     if is_new:
         threading.Thread(
             target=_process_referral_reward, args=(uid,), daemon=True
+        ).start()
+        # Send cached welcome media (photos/videos) as a separate batch.
+        threading.Thread(
+            target=_send_welcome_media, args=(uid,), daemon=True
         ).start()
 
     n    = user_count()
@@ -328,8 +496,10 @@ def _help_text(is_adm: bool) -> str:
             "`/ban [reason]` — ban (reply to message)\n"
             "`/unban` — unban user\n"
             "`/mute 10min [reason]` — mute with duration\n"
+            "`/pin` — pin a message in every chat (reply to it)\n"
             "`/del 5sec` · `/del 2min` — schedule delete\n"
             "`/delete` — delete one message (reply to it)\n"
+            "`/broadcast Your text` — announce to every eligible user\n"
             "`/stats` — network stats\n"
             "`/addadmin` — promote to admin (reply to message)\n"
             "\n_Durations: `s` / `min` / `h` / `d`_"
@@ -723,6 +893,74 @@ def cmd_cancel_del(msg: types.Message):
     log.info("Admin %s cancelled pending /del", msg.from_user.id)
 
 
+# ── /pin ──────────────────────────────────────────────────────────────────
+
+def cmd_pin(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        bot.reply_to(msg, "❌ You don't have admin access.")
+        return
+    if not msg.reply_to_message:
+        bot.reply_to(msg, "Reply to a relayed message with /pin to pin it in every chat it was delivered to.")
+        return
+    row = get_batch_by_msg(msg.from_user.id, msg.reply_to_message.message_id)
+    if not row:
+        bot.reply_to(msg, "❌ Could not find that message in the relay log. (Only works on relayed messages.)")
+        return
+    batch_id = row["batch_id"]
+    msgs_    = get_batch_msgs(batch_id)
+    if not msgs_:
+        bot.reply_to(msg, "❌ No delivered copies found for this message.")
+        return
+
+    def _pin_one(m):
+        _safe(bot.pin_chat_message, m["target_uid"], m["message_id"],
+              disable_notification=True, target_uid=m["target_uid"])
+
+    _parallel_dispatch(msgs_, _pin_one)
+    bot.reply_to(msg, f"📌 Pinned in {len(msgs_)} chat(s).")
+    log.info("Admin %s pinned batch %s (%d chats)", msg.from_user.id, batch_id, len(msgs_))
+
+
+# ── /broadcast ────────────────────────────────────────────────────────────
+
+def cmd_broadcast(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        bot.reply_to(msg, "❌ You don't have admin access.")
+        return
+    parts = msg.text.split(maxsplit=1)
+    body  = parts[1].strip() if len(parts) > 1 else ""
+    if not body and msg.reply_to_message:
+        body = (msg.reply_to_message.text or msg.reply_to_message.caption or "").strip()
+    if not body:
+        bot.reply_to(msg,
+            "Usage: `/broadcast Your announcement here`\n"
+            "Or reply to a message with `/broadcast`.",
+            parse_mode="Markdown",
+        )
+        return
+    _run_broadcast(msg.from_user.id, body)
+    bot.reply_to(msg, "✅ Broadcast is being sent.")
+
+
+def _run_broadcast(admin_uid: int, body: str):
+    text = broadcast_message_text(body)
+
+    def _do():
+        targets = [u for u in active_users() if _is_eligible_recipient(u)]
+
+        def _send_one(u):
+            _safe(bot.send_message, u["user_id"], text,
+                  target_uid=u["user_id"])
+
+        _parallel_dispatch(targets, _send_one)
+        _safe(bot.send_message, admin_uid,
+              f"📢 Broadcast delivered to *{len(targets)}* user(s).",
+              parse_mode="Markdown", target_uid=admin_uid)
+        log.info("Admin %s broadcast to %d users", admin_uid, len(targets))
+
+    threading.Thread(target=_do, daemon=True).start()
+
+
 # ── /delete ───────────────────────────────────────────────────────────────
 
 def cmd_delete(msg: types.Message):
@@ -876,12 +1114,7 @@ def on_callback(call: types.CallbackQuery):
     if data == "admin:backups":
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Access denied"); return
-        from database import _db_op
-        total_b = _db_op(lambda c: c.execute("SELECT COUNT(*) FROM media_backup").fetchone()[0])
-        by_type = _db_op(lambda c: c.execute(
-            "SELECT file_type, COUNT(*) as cnt, SUM(file_size) as total_size "
-            "FROM media_backup GROUP BY file_type ORDER BY cnt DESC"
-        ).fetchall())
+        total_b, by_type = get_backup_stats()
         lines = [f"💾 *Media Backup Stats*\n━━━━━━━━━━━━━━━━━\n\nTotal: *{total_b}* files\n"]
         for r in by_type:
             sz_mb = (r["total_size"] or 0) / 1_048_576
@@ -1153,12 +1386,7 @@ def on_callback(call: types.CallbackQuery):
     if data == "admin:muted":
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Access denied"); return
-        from database import _db_op, _now
-        now_str = _now()
-        rows = _db_op(lambda c: c.execute(
-            "SELECT * FROM users WHERE muted_until IS NOT NULL AND muted_until > ?",
-            (now_str,)
-        ).fetchall())
+        rows = get_muted_users()
         if not rows:
             bot.answer_callback_query(call.id, "No muted users right now.", show_alert=True)
             return
@@ -1180,6 +1408,44 @@ def on_callback(call: types.CallbackQuery):
         except Exception:
             pass
         bot.answer_callback_query(call.id)
+        return
+
+    # ── Welcome media collection ──────────────────────────────────────────────
+    if data == "welcome:start":
+        if not is_main_admin(uid):
+            bot.answer_callback_query(call.id, "Main admin only"); return
+        with _collecting_welcome_lock:
+            _collecting_welcome.add(uid)
+        bot.answer_callback_query(call.id)
+        current = count_welcome_media()
+        bot.send_message(
+            uid,
+            "🎬 *Welcome Media Setup*\n"
+            "━━━━━━━━━━━━━━━━━\n\n"
+            f"Currently cached: *{current}* item(s)\n\n"
+            "Send photos, videos, or GIFs one by one — each will be added to "
+            "the pool new users get greeted with.\n"
+            "Tap *✅ Done* below when you're finished.",
+            parse_mode="Markdown",
+            reply_markup=welcome_collect_keyboard(),
+        )
+        return
+
+    # ── Broadcast (button flow) ───────────────────────────────────────────────
+    if data == "broadcast:start":
+        if not is_main_admin(uid):
+            bot.answer_callback_query(call.id, "Main admin only"); return
+        with _awaiting_lock:
+            _awaiting[uid] = {"action": "broadcast_msg"}
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            uid,
+            "📢 *Broadcast*\n"
+            "━━━━━━━━━━━━━━━━━\n\n"
+            "Type the message you want to send to every eligible user.\n"
+            "It will be sent with attention emojis and large bold text automatically.",
+            parse_mode="Markdown",
+        )
         return
 
     # ── Add admin ───────────────────────────────────────────────────────────
@@ -1380,7 +1646,53 @@ def handle_message(msg: types.Message):
 
     row = get_user(uid)
 
-    # ── Awaiting input (admin video size setting) ────────────────────────────
+    # ── Welcome media collection mode (admin-only, separate from relay) ──────
+    with _collecting_welcome_lock:
+        collecting = uid in _collecting_welcome
+    if collecting:
+        if not is_main_admin(uid):
+            # Safety net: role revoked mid-session.
+            with _collecting_welcome_lock:
+                _collecting_welcome.discard(uid)
+        elif msg.text and msg.text.strip() == "✅ Done":
+            with _collecting_welcome_lock:
+                _collecting_welcome.discard(uid)
+            total = count_welcome_media()
+            bot.reply_to(msg,
+                f"✅ *Welcome media setup finished.*\n\n"
+                f"Cached items: *{total}*\n"
+                f"New users will now receive {min(WELCOME_MEDIA_COUNT, total)} random item(s) on /start.",
+                parse_mode="Markdown",
+                reply_markup=remove_keyboard(),
+            )
+            return
+        else:
+            file_id = None
+            file_type = None
+            if msg.photo:
+                file_id, file_type = msg.photo[-1].file_id, "photo"
+            elif msg.video:
+                file_id, file_type = msg.video.file_id, "video"
+            elif msg.animation:
+                file_id, file_type = msg.animation.file_id, "animation"
+
+            if file_id:
+                add_welcome_media(file_id, file_type, uid)
+                bot.reply_to(msg,
+                    "✅ This file has been added to your list✔️\n"
+                    "Send a new file, or tap *Done* to finish.",
+                    parse_mode="Markdown",
+                    reply_markup=welcome_collect_keyboard(),
+                )
+            else:
+                bot.reply_to(msg,
+                    "⚠️ Please send a photo, video, or GIF — or tap *Done* to finish.",
+                    parse_mode="Markdown",
+                    reply_markup=welcome_collect_keyboard(),
+                )
+            return
+
+    # ── Awaiting input (admin video size setting, broadcast, etc.) ───────────
     with _awaiting_lock:
         aw = _awaiting.pop(uid, None) if msg.text else None
     if aw is not None:
@@ -1395,6 +1707,13 @@ def handle_message(msg: types.Message):
                 bot.reply_to(msg,
                     f"❌ The name *{md(name)}* is already taken. Try a different name.",
                     parse_mode="Markdown")
+        elif aw["action"] == "broadcast_msg":
+            body = (msg.text or "").strip()
+            if not body:
+                bot.reply_to(msg, "❌ Broadcast text cannot be empty.")
+            else:
+                _run_broadcast(uid, body)
+                bot.reply_to(msg, "✅ Broadcast is being sent.")
         else:
             try:
                 mb    = float(msg.text.strip())
@@ -1515,10 +1834,14 @@ def handle_message(msg: types.Message):
         backup_message_media(bot, msg, uid)
 
     # ── Relay ─────────────────────────────────────────────────────────────────
-    target_count = len(active_users(exclude_id=uid))
+    # Filter once, up front, so the confirmation count below always matches
+    # exactly who receives the message — banned/muted/expired users are
+    # excluded here and never even handed to relay_message.
+    targets      = [t for t in active_users(exclude_id=uid) if _is_eligible_recipient(t)]
+    target_count = len(targets)
     threading.Thread(
         target=relay_message,
-        args=(uid, msg.chat.id, msg),
+        args=(uid, msg.chat.id, msg, targets),
         daemon=True,
     ).start()
 

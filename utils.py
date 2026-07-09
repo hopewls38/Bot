@@ -143,13 +143,15 @@ def admin_panel_text(s) -> str:
     return (
         "🛡 *Admin Panel*\n"
         "━━━━━━━━━━━━━━━━━\n\n"
-        f"👥 Total users:     *{s['total']}*\n"
-        f"🟢 Active:          *{s['active']}*\n"
-        f"🔴 Banned:          *{s['banned']}*\n"
-        f"🕐 Active (24h):    *{s['recent_24h']}*\n"
-        f"🛡 Admins:          *{s['admins']}*\n"
-        f"💾 Media backups:   *{s.get('backups', 0)}*\n"
-        f"🔗 Referrals:       *{s.get('referrals', 0)}*\n"
+        f"👥 Total users:       *{s['total']}*\n"
+        f"🟢 Can receive media: *{s.get('eligible_active', s['active'])}*\n"
+        f"🔇 Muted:             *{s.get('muted', 0)}*\n"
+        f"⏳ Expired (no time): *{s.get('expired', 0)}*\n"
+        f"🔴 Banned:            *{s['banned']}*\n"
+        f"🕐 Active (24h):      *{s['recent_24h']}*\n"
+        f"🛡 Admins:            *{s['admins']}*\n"
+        f"💾 Media backups:     *{s.get('backups', 0)}*\n"
+        f"🔗 Referrals:         *{s.get('referrals', 0)}*\n"
         "━━━━━━━━━━━━━━━━━"
     )
 
@@ -171,3 +173,36 @@ def media_settings_text(ms) -> str:
 def mute_duration_text(seconds: int) -> str:
     """Human-readable mute duration for notifications."""
     return fmt_time(seconds)
+
+
+# ── Broadcast styling ─────────────────────────────────────────────────────────
+
+_BOLD_MAP = {}
+for _i, _c in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ"):
+    _BOLD_MAP[_c] = chr(0x1D400 + _i)
+for _i, _c in enumerate("abcdefghijklmnopqrstuvwxyz"):
+    _BOLD_MAP[_c] = chr(0x1D41A + _i)
+for _i, _c in enumerate("0123456789"):
+    _BOLD_MAP[_c] = chr(0x1D7CE + _i)
+
+
+def to_big_bold(text: str) -> str:
+    """
+    Convert plain ASCII text to Unicode Mathematical Bold characters.
+    Unlike Markdown '*bold*', this renders as visibly larger/bolder text on
+    every Telegram client and notification preview, regardless of parse mode.
+    Non-Latin characters (e.g. emoji, punctuation) pass through unchanged.
+    """
+    return "".join(_BOLD_MAP.get(ch, ch) for ch in text)
+
+
+def broadcast_message_text(body: str) -> str:
+    """Build an eye-catching admin broadcast with attention emojis and large font."""
+    big = to_big_bold(body.strip())
+    return (
+        "📢🔔📢 " + to_big_bold("ANNOUNCEMENT") + " 📢🔔📢\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
+        f"{big}\n\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "🛡 Sent by an admin"
+    )

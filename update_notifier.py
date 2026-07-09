@@ -1,4 +1,4 @@
-# update_notifier.py — اطلاع‌رسانی آپدیت + seed کاربران قدیمی
+# update_notifier.py — one-time update announcement + legacy user seeding
 
 import time
 import logging
@@ -6,12 +6,12 @@ import threading
 
 log = logging.getLogger("relay")
 
-# ── تنظیمات ──────────────────────────────────────────────────────────────────
+# ── Settings ─────────────────────────────────────────────────────────────────
 UPDATE_EVENT_KEY  = "update_v2_notified"
-UPDATE_BONUS_SECS = 10 * 3600   # ۱۰ ساعت هدیه
+UPDATE_BONUS_SECS = 10 * 3600   # 10-hour gift
 
-# user ID های کاربران قدیمی (استخراج‌شده از لاگ Railway)
-# نکته: 1336613182 عمداً حذف شده چون توسط ادمین بن شده بود (لاگ: banned user 1336613182)
+# Legacy user IDs (recovered from Railway logs)
+# Note: 1336613182 intentionally excluded — was banned by an admin (log: banned user 1336613182)
 SEED_USER_IDS = [
     1369887647, 1369983594, 1519357100, 1624684502,
     1736220898, 5064884202, 5080959393, 5136399172, 5246305930,
@@ -24,17 +24,17 @@ SEED_USER_IDS = [
 ]
 
 UPDATE_MESSAGE = (
-    "🔔 *ربات آپدیت شد\\!*\n"
+    "🔔 *The bot has been updated\\!*\n"
     "━━━━━━━━━━━━━━━━━\n\n"
-    "سلام 👋 ربات به\\-روزرسانی شد و قابلیت‌های جدیدی اضافه شده:\n\n"
-    "🔗 *دعوت دوستان = زمان رایگان*\n"
-    "هر دعوت موفق ۲ ساعت به شما و دوستتان اضافه می‌کند\n\n"
-    "📸 *هر عکس = ۱ دقیقه*\n"
-    "🎬 *هر مگابایت ویدیو = ۵ دقیقه*\n\n"
-    "🎨 *طراحی و رابط کاربری بهتر*\n\n"
+    "Hey 👋 the bot just got a fresh update with new features:\n\n"
+    "🔗 *Invite friends = free time*\n"
+    "Every successful invite adds 2 hours for you and your friend\n\n"
+    "📸 *Every photo = 1 minute*\n"
+    "🎬 *Every MB of video = 5 minutes*\n\n"
+    "🎨 *Improved design and interface*\n\n"
     "━━━━━━━━━━━━━━━━━\n"
-    "🎁 به‌عنوان هدیه آپدیت، *۱۰ ساعت* به زمان شما اضافه شد\\!\n"
-    "برای مشاهده موجودی: /id"
+    "🎁 As an update gift, *10 hours* were added to your time balance\\!\n"
+    "To check your balance: /id"
 )
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -66,14 +66,14 @@ def _do_notify(bot):
 
         log.info("update_notifier: starting...")
 
-        # ثبت کاربران قدیمی در PostgreSQL (اگه هنوز نیستن)
+        # Register legacy users in PostgreSQL (if not already present)
         for uid in SEED_USER_IDS:
             try:
                 upsert_user(uid, "")
             except Exception as e:
                 log.warning("update_notifier: seed error uid=%s: %s", uid, e)
 
-        # گرفتن همه user id ها از DB
+        # Fetch every user id from the DB
         user_ids = get_all_non_banned_user_ids()
         log.info("update_notifier: %d users to notify", len(user_ids))
 

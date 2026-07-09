@@ -29,3 +29,19 @@ MEDIA_FIELDS = frozenset({
     "allow_sticker", "allow_voice", "allow_audio", "allow_document",
     "min_video_bytes", "max_video_bytes",
 })
+
+# ── Welcome media ────────────────────────────────────────────────────────────
+# How many cached welcome media items are sent to a brand-new user.
+WELCOME_MEDIA_COUNT = 10
+
+# ── Performance ──────────────────────────────────────────────────────────────
+# Number of worker threads used to fan a single message out to many chats at
+# once (relay, broadcast, welcome media). Higher = faster delivery, but stays
+# well under Telegram's global rate limit (~30 msg/sec) for typical group sizes.
+RELAY_WORKERS = 8
+
+# ── Expired-time reminders ───────────────────────────────────────────────────
+# Minimum gap between two reminder DMs to the same expired user. Combined
+# with the maintenance loop's own 6h cadence, this is a hard per-user floor
+# so a clock/tick drift can never turn into a spam loop.
+EXPIRED_REMINDER_INTERVAL_SECS = 6 * 3600

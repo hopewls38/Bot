@@ -8,7 +8,7 @@
 from telebot import types
 from database import (
     get_user, all_users_paged, is_main_admin,
-    _row_access_secs, get_referral_count,
+    _row_access_secs, get_referral_count, get_banned_users_paged,
 )
 from utils import fmt_time
 from datetime import datetime, timezone
@@ -103,6 +103,10 @@ def admin_keyboard(uid):
         kb.add(
             types.InlineKeyboardButton("⚙️ Media Settings", callback_data="media:show"),
             types.InlineKeyboardButton("➕ Add Admin",        callback_data="admin:addadmin"),
+        )
+        kb.add(
+            types.InlineKeyboardButton("🎬 Welcome Media",  callback_data="welcome:start"),
+            types.InlineKeyboardButton("📢 Broadcast",       callback_data="broadcast:start"),
         )
     kb.add(types.InlineKeyboardButton("🔃 Refresh Panel", callback_data="admin:back"))
     return kb
@@ -210,17 +214,7 @@ def user_action_keyboard(target_uid, back_page=0):
 
 
 def banned_users_keyboard(page=0):
-    from database import _db_op
-    def _q(c):
-        total = c.execute(
-            "SELECT COUNT(*) FROM users WHERE is_banned=1"
-        ).fetchone()[0]
-        rows  = c.execute(
-            "SELECT * FROM users WHERE is_banned=1 ORDER BY joined_at DESC LIMIT 6 OFFSET ?",
-            (page * 6,),
-        ).fetchall()
-        return rows, total
-    rows, total = _db_op(_q)
+    rows, total = get_banned_users_paged(page, per_page=6)
     kb = types.InlineKeyboardMarkup(row_width=1)
     for u in rows:
         name = u["display_name"] or u["random_id"]
@@ -276,3 +270,16 @@ def backups_keyboard():
         types.InlineKeyboardButton("🔙 Back",           callback_data="admin:back"),
     )
     return kb
+
+
+# ── Welcome media collection ──────────────────────────────────────────────────
+
+def welcome_collect_keyboard():
+    """Reply keyboard shown while an admin is uploading welcome media."""
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
+    kb.add(types.KeyboardButton("✅ Done"))
+    return kb
+
+
+def remove_keyboard():
+    return types.ReplyKeyboardRemove()

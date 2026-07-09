@@ -63,6 +63,29 @@ def init_db():
                     access_until   TEXT    DEFAULT NULL
                 )
             """)
+            # Tracks the last time we DM'd a time-expired user a reminder, so
+            # the 6-hourly reminder job never re-sends more often than that.
+            cur.execute("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS last_expired_reminder TEXT DEFAULT NULL
+            """)
+
+            # Cheap, indexed eligibility lookups keep the admin panel / relay
+            # confirmation counts and the reminder job fast as the users table
+            # grows — this matters directly for hosting cost, since Postgres
+            # would otherwise scan the whole table on every relayed message.
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_users_active_banned "
+                "ON users(active, is_banned)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_users_access_until "
+                "ON users(access_until)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_users_muted_until "
+                "ON users(muted_until)"
+            )
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS relay_log (
@@ -135,6 +158,16 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS bot_events (
                     key        TEXT PRIMARY KEY,
                     fired_at   TEXT NOT NULL
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS welcome_media (
+                    id          SERIAL  PRIMARY KEY,
+                    file_id     TEXT    NOT NULL,
+                    file_type   TEXT    NOT NULL,
+                    added_by    BIGINT  NOT NULL,
+                    added_at    TEXT    NOT NULL
                 )
             """)
 
@@ -467,12 +500,37 @@ def stats():
         conn = _conn()
         try:
             cur = conn.cursor()
+            now = _now()
             cur.execute("SELECT COUNT(*) as cnt FROM users")
             total = cur.fetchone()["cnt"]
             cur.execute("SELECT COUNT(*) as cnt FROM users WHERE active=1 AND is_banned=0")
             active = cur.fetchone()["cnt"]
             cur.execute("SELECT COUNT(*) as cnt FROM users WHERE is_banned=1")
             banned = cur.fetchone()["cnt"]
+            cur.execute(
+                "SELECT COUNT(*) as cnt FROM users "
+                "WHERE muted_until IS NOT NULL AND muted_until > %s",
+                (now,),
+            )
+            muted = cur.fetchone()["cnt"]
+            # "Eligible" = would actually receive a relayed/broadcast message
+            # right now: active, not banned, not muted, admin or time left.
+            cur.execute(
+                "SELECT COUNT(*) as cnt FROM users WHERE active=1 AND is_banned=0 "
+                "AND (muted_until IS NULL OR muted_until <= %s) "
+                "AND (role>=1 OR (access_until IS NOT NULL AND access_until > %s))",
+                (now, now),
+            )
+            eligible_active = cur.fetchone()["cnt"]
+            # Non-admin, in-network, not banned/muted, but out of access time.
+            cur.execute(
+                "SELECT COUNT(*) as cnt FROM users WHERE active=1 AND is_banned=0 "
+                "AND role=0 "
+                "AND (muted_until IS NULL OR muted_until <= %s) "
+                "AND (access_until IS NULL OR access_until <= %s)",
+                (now, now),
+            )
+            expired = cur.fetchone()["cnt"]
             cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
             cur.execute(
                 "SELECT COUNT(*) as cnt FROM users WHERE last_seen>%s AND is_banned=0",
@@ -487,9 +545,86 @@ def stats():
             refs = cur.fetchone()["cnt"]
             return {
                 "total": total, "active": active, "banned": banned,
+                "muted": muted, "eligible_active": eligible_active,
+                "expired": expired,
                 "recent_24h": recent, "admins": admins,
                 "backups": backups, "referrals": refs,
             }
+        finally:
+            conn.close()
+
+
+def get_eligible_active_count() -> int:
+    """Users who would actually receive a relayed/broadcast message right now."""
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            now = _now()
+            cur.execute(
+                "SELECT COUNT(*) as cnt FROM users WHERE active=1 AND is_banned=0 "
+                "AND (muted_until IS NULL OR muted_until <= %s) "
+                "AND (role>=1 OR (access_until IS NOT NULL AND access_until > %s))",
+                (now, now),
+            )
+            return cur.fetchone()["cnt"]
+        finally:
+            conn.close()
+
+
+def get_expired_users():
+    """Non-admin, in-network, not banned/muted users whose access time is up."""
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            now = _now()
+            cur.execute(
+                "SELECT * FROM users WHERE active=1 AND is_banned=0 AND role=0 "
+                "AND (muted_until IS NULL OR muted_until <= %s) "
+                "AND (access_until IS NULL OR access_until <= %s)",
+                (now, now),
+            )
+            return cur.fetchall()
+        finally:
+            conn.close()
+
+
+def get_users_needing_expired_reminder(min_interval_secs: int):
+    """
+    Same population as get_expired_users(), further limited to users who
+    either never got a reminder or got one more than min_interval_secs ago —
+    this is what keeps the reminder job from re-DMing the same user constantly.
+    """
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            now    = _now()
+            cutoff = (datetime.now(timezone.utc)
+                      - timedelta(seconds=min_interval_secs)).isoformat()
+            cur.execute(
+                "SELECT * FROM users WHERE active=1 AND is_banned=0 AND role=0 "
+                "AND (muted_until IS NULL OR muted_until <= %s) "
+                "AND (access_until IS NULL OR access_until <= %s) "
+                "AND (last_expired_reminder IS NULL OR last_expired_reminder <= %s)",
+                (now, now, cutoff),
+            )
+            return cur.fetchall()
+        finally:
+            conn.close()
+
+
+def mark_expired_reminder_sent(uid):
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE users SET last_expired_reminder=%s WHERE user_id=%s",
+                (_now(), uid),
+            )
+            conn.commit()
         finally:
             conn.close()
 
@@ -693,6 +828,25 @@ def get_backup(file_unique_id: str):
 
 # ── Mute / ban state checks ───────────────────────────────────────────────────
 
+def _row_is_muted(row) -> bool:
+    """
+    Mute check against an already-fetched row — no DB call. Used for bulk
+    filtering (relay/broadcast target lists) so checking N recipients doesn't
+    cost N extra queries. Does NOT clear an expired mute (that still happens
+    lazily via is_muted()) — it's a read-only, fast-path check.
+    """
+    mu = row.get("muted_until") if isinstance(row, dict) else row["muted_until"]
+    if not mu:
+        return False
+    try:
+        until = datetime.fromisoformat(mu)
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) < until
+    except Exception:
+        return False
+
+
 def is_muted(uid) -> bool:
     row = get_user(uid)
     if not row or not row["muted_until"]:
@@ -747,6 +901,111 @@ def set_bot_event(key: str):
                 "ON CONFLICT (key) DO UPDATE SET fired_at=EXCLUDED.fired_at",
                 (key, _now()),
             )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def get_banned_users_paged(page=0, per_page=6):
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) as cnt FROM users WHERE is_banned=1")
+            total = cur.fetchone()["cnt"]
+            cur.execute(
+                "SELECT * FROM users WHERE is_banned=1 "
+                "ORDER BY joined_at DESC LIMIT %s OFFSET %s",
+                (per_page, page * per_page),
+            )
+            return cur.fetchall(), total
+        finally:
+            conn.close()
+
+
+def get_muted_users():
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT * FROM users WHERE muted_until IS NOT NULL AND muted_until > %s",
+                (_now(),),
+            )
+            return cur.fetchall()
+        finally:
+            conn.close()
+
+
+def get_backup_stats():
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) as cnt FROM media_backup")
+            total = cur.fetchone()["cnt"]
+            cur.execute(
+                "SELECT file_type, COUNT(*) as cnt, SUM(file_size) as total_size "
+                "FROM media_backup GROUP BY file_type ORDER BY cnt DESC"
+            )
+            by_type = cur.fetchall()
+            return total, by_type
+        finally:
+            conn.close()
+
+
+# ── Welcome media helpers ─────────────────────────────────────────────────────
+# Only the Telegram `file_id` is ever stored — the bot never downloads the
+# actual file, so this carries zero RAM/bandwidth cost (same principle the
+# relay itself uses for `copy_message`).
+
+def add_welcome_media(file_id: str, file_type: str, added_by: int):
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO welcome_media (file_id, file_type, added_by, added_at) "
+                "VALUES (%s,%s,%s,%s)",
+                (file_id, file_type, added_by, _now()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def count_welcome_media() -> int:
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) as cnt FROM welcome_media")
+            return cur.fetchone()["cnt"]
+        finally:
+            conn.close()
+
+
+def get_random_welcome_media(limit: int):
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT file_id, file_type FROM welcome_media "
+                "ORDER BY RANDOM() LIMIT %s",
+                (limit,),
+            )
+            return cur.fetchall()
+        finally:
+            conn.close()
+
+
+def clear_welcome_media():
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM welcome_media")
             conn.commit()
         finally:
             conn.close()
