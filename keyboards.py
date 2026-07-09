@@ -276,9 +276,22 @@ def backups_keyboard():
 # ── Welcome media collection ──────────────────────────────────────────────────
 
 def welcome_collect_keyboard():
-    """Reply keyboard shown while an admin is uploading welcome media."""
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-    kb.add(types.KeyboardButton("✅ Done"))
+    """Inline (glass) keyboard shown while an admin is uploading welcome media.
+
+    This used to be a ReplyKeyboardMarkup, which had two problems:
+      1. Its "✅ Done" button sent a plain text message — if that text message
+         ever slipped past the collection-mode gate (e.g. admin role revoked
+         mid-session), it would fall straight into the normal relay path and
+         get broadcast to every user in the network.
+      2. Reply keyboards are sticky per-chat: some admins ended up with the
+         button "stuck" on their keyboard permanently, unrelated to whether
+         they were still in collection mode.
+    An inline keyboard sends a callback_query instead of a text message, so it
+    can never be relayed to other users, and it isn't tied to the chat's
+    persistent keyboard at all — nothing to get "stuck".
+    """
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("✅ Done", callback_data="welcome:done"))
     return kb
 
 

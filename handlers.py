@@ -1441,6 +1441,11 @@ def on_callback(call: types.CallbackQuery):
             _collecting_welcome.add(uid)
         bot.answer_callback_query(call.id)
         current = count_welcome_media()
+        # Clear any leftover reply keyboard from an older version of this flow
+        # (this is what caused the "✅ Done" button to look permanently stuck
+        # for some admins) before showing the new inline "Done" button.
+        _safe(bot.send_message, uid, "⏳ Preparing upload session…",
+              reply_markup=remove_keyboard(), target_uid=uid)
         bot.send_message(
             uid,
             "🎬 *Welcome Media Setup*\n"
@@ -1448,10 +1453,37 @@ def on_callback(call: types.CallbackQuery):
             f"Currently cached: *{current}* item(s)\n\n"
             "Send photos, videos, or GIFs one by one — each will be added to "
             "the pool new users get greeted with.\n"
+            "These files are only cached for the welcome flow and are *never* "
+            "relayed to the network.\n"
             "Tap *✅ Done* below when you're finished.",
             parse_mode="Markdown",
             reply_markup=welcome_collect_keyboard(),
         )
+        return
+
+    # ── Welcome media collection — finish (inline "✅ Done" button) ───────────
+    if data == "welcome:done":
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Admins only"); return
+        with _collecting_welcome_lock:
+            was_collecting = uid in _collecting_welcome
+            _collecting_welcome.discard(uid)
+        bot.answer_callback_query(call.id, "Done ✅")
+        total = count_welcome_media()
+        text = (
+            f"✅ *Welcome media setup finished.*\n\n"
+            f"Cached items: *{total}*\n"
+            f"New users will now receive {min(WELCOME_MEDIA_COUNT, total)} random item(s) on /start."
+        ) if was_collecting else (
+            f"ℹ️ Upload session was already closed.\nCached items: *{total}*"
+        )
+        try:
+            bot.edit_message_text(
+                text, call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown",
+            )
+        except Exception:
+            bot.send_message(uid, text, parse_mode="Markdown")
         return
 
     # ── Broadcast (button flow) ───────────────────────────────────────────────
@@ -1674,15 +1706,25 @@ def handle_message(msg: types.Message):
         collecting = uid in _collecting_welcome
     if collecting:
         if not is_admin(uid):
-            # Safety net: admin role revoked mid-session. Matches the
-            # is_admin() gate on "welcome:start" — using is_main_admin() here
-            # instead used to kick any non-main admin out of collection mode
-            # on their very first message, letting it fall through to the
-            # relay/broadcast path below (that's why their media and the
-            # "✅ Done" button text were being relayed to the whole chat).
+            # Safety net: admin role revoked mid-session. This branch used to
+            # fall through to the relay/broadcast path below after discarding
+            # the user from collection mode — that's exactly why the welcome
+            # media (and any leftover "✅ Done" button press) could end up
+            # relayed to every user in the network. We now always stop here
+            # instead of letting anything from a collection-mode session leak
+            # into the normal message flow.
             with _collecting_welcome_lock:
                 _collecting_welcome.discard(uid)
+            bot.reply_to(msg,
+                "ℹ️ Your admin access changed, so welcome-media upload mode was closed.",
+                reply_markup=remove_keyboard(),
+            )
+            return
         elif msg.text and msg.text.strip() == "✅ Done":
+            # Legacy fallback only: older clients may still have the retired
+            # reply-keyboard "✅ Done" button stuck on screen. Honor it once,
+            # finish the same way the new inline "Done ✅" button does, and
+            # explicitly clear the stuck reply keyboard so it stops appearing.
             with _collecting_welcome_lock:
                 _collecting_welcome.discard(uid)
             total = count_welcome_media()
