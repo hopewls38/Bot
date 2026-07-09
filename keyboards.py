@@ -7,7 +7,7 @@
 
 from telebot import types
 from database import (
-    get_user, all_users_paged, is_main_admin,
+    get_user, all_users_paged, is_main_admin, is_admin,
     _row_access_secs, get_referral_count, get_banned_users_paged,
 )
 from utils import fmt_time
@@ -104,6 +104,7 @@ def admin_keyboard(uid):
             types.InlineKeyboardButton("⚙️ Media Settings", callback_data="media:show"),
             types.InlineKeyboardButton("➕ Add Admin",        callback_data="admin:addadmin"),
         )
+    if is_admin(uid):
         kb.add(
             types.InlineKeyboardButton("🎬 Welcome Media",  callback_data="welcome:start"),
             types.InlineKeyboardButton("📢 Broadcast",       callback_data="broadcast:start"),

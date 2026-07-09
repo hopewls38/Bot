@@ -1412,8 +1412,8 @@ def on_callback(call: types.CallbackQuery):
 
     # ── Welcome media collection ──────────────────────────────────────────────
     if data == "welcome:start":
-        if not is_main_admin(uid):
-            bot.answer_callback_query(call.id, "Main admin only"); return
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Admins only"); return
         with _collecting_welcome_lock:
             _collecting_welcome.add(uid)
         bot.answer_callback_query(call.id)
@@ -1433,8 +1433,8 @@ def on_callback(call: types.CallbackQuery):
 
     # ── Broadcast (button flow) ───────────────────────────────────────────────
     if data == "broadcast:start":
-        if not is_main_admin(uid):
-            bot.answer_callback_query(call.id, "Main admin only"); return
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Admins only"); return
         with _awaiting_lock:
             _awaiting[uid] = {"action": "broadcast_msg"}
         bot.answer_callback_query(call.id)
