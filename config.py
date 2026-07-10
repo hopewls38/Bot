@@ -10,9 +10,9 @@ BACKUP_CHANNEL_ID = int(os.environ.get("BACKUP_CHANNEL_ID", "0"))   # 0 = disabl
 
 # ── Timing ───────────────────────────────────────────────────────────────────
 SEND_DELAY        = 0.05
-SPAM_WINDOW       = 30
-SPAM_LIMIT        = 20
-MUTE_SECONDS      = 300
+SPAM_WINDOW       = 35
+SPAM_LIMIT        = 40
+MUTE_SECONDS      = 30
 DEL_COUNTDOWN     = 600
 GRACE_SECONDS     = 3600
 LOW_TIME_WARN     = 600

@@ -1852,7 +1852,7 @@ def handle_message(msg: types.Message):
 
     if check_spam(uid):
         set_mute(uid, MUTE_SECONDS)
-        bot.reply_to(msg, "⚠️ You're sending too fast. You have been muted for 5 minutes.")
+        bot.reply_to(msg, "⚠️ You're sending too fast. You have been muted for 30 seconds.")
         return
 
     touch_user(uid)
