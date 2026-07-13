@@ -14,7 +14,8 @@ from config import (
     MAIN_ADMIN_ID, MUTE_SECONDS, DEL_COUNTDOWN, SPAM_WINDOW, SPAM_LIMIT,
     LOW_TIME_WARN, GRACE_SECONDS, PHOTO_REWARD_SECS, VIDEO_REWARD_PER_MB,
     BYTES_PER_MIN, REFERRAL_REWARD_SECS, WELCOME_MEDIA_COUNT, RELAY_WORKERS,
-    EXPIRED_REMINDER_INTERVAL_SECS,
+    EXPIRED_REMINDER_INTERVAL_SECS, SMALL_VIDEO_MB_THRESHOLD,
+    SMALL_VIDEO_STREAK_LIMIT,
 )
 from database import (
     get_user, upsert_user, set_display_name, touch_user, ban_user, unban_user,
@@ -34,7 +35,7 @@ from database import (
 from utils import (
     md, fmt_time, time_bar, parse_duration, parse_del_time,
     user_info_text, admin_panel_text, media_settings_text,
-    broadcast_message_text,
+    broadcast_message_text, strip_links,
 )
 from keyboards import (
     user_time_keyboard, user_time_keyboard_refresh, admin_keyboard,
@@ -61,6 +62,11 @@ _shutdown   = threading.Event()
 # Admins currently in "collect welcome media" mode (in-memory, ephemeral).
 _collecting_welcome      = set()
 _collecting_welcome_lock = threading.Lock()
+
+# Tracks each user's current streak of consecutive small videos (in-memory,
+# ephemeral) — used to trigger the small-video spam warning below.
+_small_video_streak      = {}
+_small_video_streak_lock = threading.Lock()
 
 _CAP_TYPES  = ("photo", "video", "animation", "audio", "document", "voice")
 _DEAD_ERRS  = ("bot was blocked", "user is deactivated", "chat not found",
@@ -165,13 +171,20 @@ def prune_memory_state():
         if len(_awaiting) > 1000:
             _awaiting.clear()
             log.warning("Cleared _awaiting state: exceeded safety cap")
+    with _small_video_streak_lock:
+        if len(_small_video_streak) > 2000:
+            _small_video_streak.clear()
+            log.warning("Cleared _small_video_streak state: exceeded safety cap")
 
 
 # ── Relay core ────────────────────────────────────────────────────────────────
 
 def _relay_to(source_chat_id, message, target_uid, prefix) -> list:
     tid  = target_uid
-    cap  = prefix.strip() + ("\n\n" + message.caption if message.caption else "")
+    caption_text = message.caption
+    if caption_text and (message.photo or message.video):
+        caption_text = strip_links(caption_text)
+    cap  = prefix.strip() + ("\n\n" + caption_text if caption_text else "")
     sent = []
 
     def _s(fn, *a, **kw):
@@ -1888,6 +1901,31 @@ def handle_message(msg: types.Message):
         size_bytes  = msg.video.file_size or 0
         mb          = size_bytes / BYTES_PER_MIN
         earned_secs = int(mb * VIDEO_REWARD_PER_MB)
+
+        # ── Small-video streak check ────────────────────────────────────────
+        # Warns the user if they send too many small videos (under the
+        # threshold) back-to-back — resets whenever a normal-size video
+        # breaks the streak, and resets again right after warning.
+        if mb < SMALL_VIDEO_MB_THRESHOLD:
+            with _small_video_streak_lock:
+                streak = _small_video_streak.get(uid, 0) + 1
+                if streak >= SMALL_VIDEO_STREAK_LIMIT:
+                    _small_video_streak[uid] = 0
+                    fire_warning = True
+                else:
+                    _small_video_streak[uid] = streak
+                    fire_warning = False
+            if fire_warning:
+                bot.reply_to(msg,
+                    f"⚠️ *Notice:* You've sent {SMALL_VIDEO_STREAK_LIMIT} small videos "
+                    f"(under {SMALL_VIDEO_MB_THRESHOLD} MB) in a row.\n"
+                    "Please avoid sending too many low-size videos back-to-back.",
+                    parse_mode="Markdown",
+                )
+        else:
+            with _small_video_streak_lock:
+                _small_video_streak[uid] = 0
+
         if earned_secs > 0:
             was_expired = add_access_time_returning_was_expired(uid, earned_secs)
             remaining = get_access_seconds(uid)

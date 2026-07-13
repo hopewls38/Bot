@@ -3,6 +3,7 @@
 import time
 import logging
 import threading
+from datetime import datetime, timezone
 
 log = logging.getLogger("relay")
 
@@ -98,3 +99,30 @@ def _do_notify(bot):
 def run_update_notifier(bot):
     threading.Thread(target=_do_notify, args=(bot,), daemon=True,
                      name="update-notifier").start()
+
+
+# ── Deploy-restart notice ─────────────────────────────────────────────────────
+# Unlike the one-time announcement above, this fires on EVERY process start
+# (i.e. every time the bot is redeployed/restarted on Railway after a GitHub
+# push), and is sent only to the main admin.
+
+def _do_notify_deploy(bot):
+    try:
+        from config import MAIN_ADMIN_ID
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        text = (
+            "✅ *Bot Updated & Restarted*\n"
+            "━━━━━━━━━━━━━━━━━\n\n"
+            "The latest code from GitHub has been deployed and the bot "
+            "is now running the new version.\n\n"
+            f"🕐 Restarted at: `{ts}`"
+        )
+        bot.send_message(MAIN_ADMIN_ID, text, parse_mode="Markdown")
+        log.info("deploy_notifier: restart notice sent to admin %s", MAIN_ADMIN_ID)
+    except Exception as e:
+        log.warning("deploy_notifier: failed to notify admin: %s", e)
+
+
+def run_deploy_notifier(bot):
+    threading.Thread(target=_do_notify_deploy, args=(bot,), daemon=True,
+                     name="deploy-notifier").start()

@@ -113,8 +113,11 @@ if __name__ == "__main__":
     threading.Thread(target=_maintenance_loop, daemon=True).start()
 
     # Update announcement + legacy user seeding (runs only once, ever)
-    from update_notifier import run_update_notifier
+    from update_notifier import run_update_notifier, run_deploy_notifier
     run_update_notifier(bot)
+
+    # Notify the main admin every time the bot is redeployed/restarted
+    run_deploy_notifier(bot)
 
     log.info("Polling started.")
     backoff = 5

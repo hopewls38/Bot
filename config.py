@@ -23,6 +23,12 @@ PHOTO_REWARD_SECS     = 60
 VIDEO_REWARD_PER_MB   = 300
 REFERRAL_REWARD_SECS  = 7200
 
+# ── Small-video streak warning ────────────────────────────────────────────────
+# If a user sends this many videos in a row that are each under the size
+# threshold below, the bot sends them an automatic warning notice.
+SMALL_VIDEO_MB_THRESHOLD = 5
+SMALL_VIDEO_STREAK_LIMIT = 10
+
 # ── Whitelisted fields for set_media_field ────────────────────────────────────
 MEDIA_FIELDS = frozenset({
     "allow_text", "allow_photo", "allow_video", "allow_animation",

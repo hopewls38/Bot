@@ -92,6 +92,34 @@ def parse_del_time(arg: str):
     return int(val * 60) if unit.startswith("m") else int(val)
 
 
+# ── Link stripping ────────────────────────────────────────────────────────────
+
+_URL_RE = re.compile(
+    r"(?:https?://\S+"                     # http:// or https:// links
+    r"|www\.\S+"                           # www. links
+    r"|t\.me/\S+"                          # Telegram invite/links
+    r"|(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+"
+    r"(?:com|net|org|io|me|co|info|biz|xyz|ru|ir|tv|link|club|site|online|"
+    r"shop|store|app|dev|gg|cc|to|us|uk|ca)\b(?:/\S*)?)",
+    re.IGNORECASE,
+)
+
+
+def strip_links(text: str) -> str:
+    """
+    Remove URLs/links from a block of text (used for photo/video captions),
+    leaving the rest of the text intact. Collapses extra whitespace left
+    behind after removal.
+    """
+    if not text:
+        return text
+    cleaned = _URL_RE.sub("", text)
+    # Collapse repeated blank lines / spaces created by the removal.
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 # ── User info text builders ───────────────────────────────────────────────────
 
 def user_info_text(u, ref_count: int = 0, media_count: int = 0) -> str:
