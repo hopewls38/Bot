@@ -155,12 +155,22 @@ def users_keyboard(page=0):
 
 
 def user_action_keyboard(target_uid, back_page=0):
+    """
+    The per-user admin panel. Kept deliberately short — one clear action per
+    row — with Mute and Usage Time opening their own focused builder screens
+    instead of sprawling across a wall of fixed-duration buttons.
+    """
     u = get_user(target_uid)
     if not u:
         return types.InlineKeyboardMarkup()
-    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb = types.InlineKeyboardMarkup(row_width=1)
 
-    # 🔴 Ban / 🟢 Unban
+    # ✉️ Direct Message — always first, the most common "reach out" action.
+    kb.add(types.InlineKeyboardButton(
+        "✉️ Direct Message", callback_data=f"admin:dm:{target_uid}"
+    ))
+
+    # 🔴 Ban / 🟢 Unban — stays a single click.
     if u["is_banned"]:
         kb.add(types.InlineKeyboardButton(
             "🟢 Unban", callback_data=f"admin:unban:{target_uid}"
@@ -170,7 +180,7 @@ def user_action_keyboard(target_uid, back_page=0):
             "🔴 Ban",   callback_data=f"admin:ban:{target_uid}"
         ))
 
-    # Mute / Unmute
+    # 🔇 Mute / 🔊 Unmute — Mute opens the unit + stepper builder below.
     currently_muted = False
     if u["muted_until"]:
         try:
@@ -189,27 +199,78 @@ def user_action_keyboard(target_uid, back_page=0):
             "🔇 Mute",   callback_data=f"admin:mute:{target_uid}"
         ))
 
-    # Custom mute durations
-    kb.add(
-        types.InlineKeyboardButton("⏱ Mute 5m",  callback_data=f"admin:mutefor:{target_uid}:300"),
-        types.InlineKeyboardButton("⏱ Mute 30m", callback_data=f"admin:mutefor:{target_uid}:1800"),
-    )
-    kb.add(
-        types.InlineKeyboardButton("⏱ Mute 2h",  callback_data=f"admin:mutefor:{target_uid}:7200"),
-        types.InlineKeyboardButton("⏱ Mute 1d",  callback_data=f"admin:mutefor:{target_uid}:86400"),
-    )
+    # ⏰ Usage Time — opens the increase/decrease + unit + stepper builder.
+    kb.add(types.InlineKeyboardButton(
+        "⏰ Usage Time", callback_data=f"admin:usagetime:{target_uid}"
+    ))
 
-    # Time management
-    kb.add(
-        types.InlineKeyboardButton("🔵 +30 min",   callback_data=f"admin:addtime:{target_uid}:1800"),
-        types.InlineKeyboardButton("🔵 +1 hour",   callback_data=f"admin:addtime:{target_uid}:3600"),
-    )
-    kb.add(
-        types.InlineKeyboardButton("🔵 +3 hours",  callback_data=f"admin:addtime:{target_uid}:10800"),
-        types.InlineKeyboardButton("🔵 +24 hours", callback_data=f"admin:addtime:{target_uid}:86400"),
-    )
     kb.add(types.InlineKeyboardButton(
         "🔙 Back to List", callback_data=f"admin:users:{back_page}"
+    ))
+    return kb
+
+
+# Cycle order for the mute-duration unit toggle: seconds → minutes → hours → …
+MUTE_UNIT_CYCLE = ["s", "m", "h"]
+MUTE_UNIT_LABEL = {"s": "Seconds", "m": "Minutes", "h": "Hours"}
+MUTE_UNIT_SHORT = {"s": "s", "m": "m", "h": "h"}
+
+
+def mute_builder_keyboard(target_uid, unit, value):
+    """
+    Nested mute screen: one button cycles the unit (s → m → h), a stepper
+    row adjusts the amount in that unit, then Confirm applies it. A Back
+    button returns to the user's profile without muting anyone.
+    """
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton(
+        f"🔁 Unit: {MUTE_UNIT_LABEL[unit]}",
+        callback_data=f"admin:mu:{target_uid}:{unit}:{value}:cycle",
+    ))
+    kb.row(
+        types.InlineKeyboardButton("➖", callback_data=f"admin:mu:{target_uid}:{unit}:{value}:dec"),
+        types.InlineKeyboardButton(f"{value}{MUTE_UNIT_SHORT[unit]}", callback_data="noop"),
+        types.InlineKeyboardButton("➕", callback_data=f"admin:mu:{target_uid}:{unit}:{value}:inc"),
+    )
+    kb.add(types.InlineKeyboardButton(
+        "✅ Confirm Mute", callback_data=f"admin:mu:{target_uid}:{unit}:{value}:apply"
+    ))
+    kb.add(types.InlineKeyboardButton(
+        "🔙 Back", callback_data=f"admin:mu:{target_uid}:{unit}:{value}:back"
+    ))
+    return kb
+
+
+UT_UNIT_LABEL = {"m": "Minutes", "h": "Hours"}
+UT_UNIT_SHORT = {"m": "m", "h": "h"}
+
+
+def usage_time_builder_keyboard(target_uid, direction, unit, value):
+    """
+    Nested usage-time screen: pick increase/decrease, pick the unit (m/h),
+    step the amount, then Confirm. A Back button returns to the profile
+    without changing the user's balance.
+    """
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    dir_label = "➕ Increase Balance" if direction == "add" else "➖ Decrease Balance"
+    kb.add(types.InlineKeyboardButton(
+        f"🔁 {dir_label}",
+        callback_data=f"admin:ut:{target_uid}:{direction}:{unit}:{value}:dir",
+    ))
+    kb.add(types.InlineKeyboardButton(
+        f"🔁 Unit: {UT_UNIT_LABEL[unit]}",
+        callback_data=f"admin:ut:{target_uid}:{direction}:{unit}:{value}:unit",
+    ))
+    kb.row(
+        types.InlineKeyboardButton("➖", callback_data=f"admin:ut:{target_uid}:{direction}:{unit}:{value}:dec"),
+        types.InlineKeyboardButton(f"{value}{UT_UNIT_SHORT[unit]}", callback_data="noop"),
+        types.InlineKeyboardButton("➕", callback_data=f"admin:ut:{target_uid}:{direction}:{unit}:{value}:inc"),
+    )
+    kb.add(types.InlineKeyboardButton(
+        "✅ Confirm", callback_data=f"admin:ut:{target_uid}:{direction}:{unit}:{value}:apply"
+    ))
+    kb.add(types.InlineKeyboardButton(
+        "🔙 Back", callback_data=f"admin:ut:{target_uid}:{direction}:{unit}:{value}:back"
     ))
     return kb
 

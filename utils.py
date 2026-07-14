@@ -203,6 +203,37 @@ def mute_duration_text(seconds: int) -> str:
     return fmt_time(seconds)
 
 
+_UNIT_TO_SECS = {"s": 1, "m": 60, "h": 3600}
+
+
+def mute_builder_text(u, unit: str, value: int) -> str:
+    """Header shown above the nested mute-duration builder keyboard."""
+    name = (u["display_name"] or u["random_id"]) if u else "Unknown"
+    secs = value * _UNIT_TO_SECS.get(unit, 1)
+    return (
+        "🔇 *Mute User*\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
+        f"Target: *{md(name)}*\n"
+        f"Duration: *{fmt_time(secs)}*\n\n"
+        "Pick a unit and amount below, then confirm."
+    )
+
+
+def usage_time_builder_text(u, direction: str, unit: str, value: int) -> str:
+    """Header shown above the nested usage-time builder keyboard."""
+    name = (u["display_name"] or u["random_id"]) if u else "Unknown"
+    secs = value * (60 if unit == "m" else 3600)
+    verb = "Increase" if direction == "add" else "Decrease"
+    sign = "+" if direction == "add" else "-"
+    return (
+        "⏰ *Adjust Usage Time*\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
+        f"Target: *{md(name)}*\n"
+        f"Action: *{verb}* balance by *{sign}{fmt_time(secs)}*\n\n"
+        "Pick a direction, unit and amount below, then confirm."
+    )
+
+
 # ── Broadcast styling ─────────────────────────────────────────────────────────
 
 _BOLD_MAP = {}

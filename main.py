@@ -32,7 +32,7 @@ from handlers import (
     cmd_start, cmd_help, cmd_id, cmd_referral, cmd_leave, cmd_name,
     cmd_admin, cmd_users, cmd_ban, cmd_unban, cmd_mute, cmd_addadmin,
     cmd_del, cmd_cancel_del, cmd_delete, cmd_stats, cmd_unknown,
-    cmd_pin, cmd_broadcast,
+    cmd_pin, cmd_broadcast, cmd_prof,
     on_callback, handle_message,
     prune_memory_state, check_low_time_users, remind_expired_users, _shutdown,
 )
@@ -54,6 +54,7 @@ bot.register_message_handler(cmd_delete,   commands=["delete", "Delete"],    pas
 bot.register_message_handler(cmd_pin,      commands=["pin"],                 pass_bot=False)
 bot.register_message_handler(cmd_broadcast, commands=["broadcast"],          pass_bot=False)
 bot.register_message_handler(cmd_stats,    commands=["stats"],               pass_bot=False)
+bot.register_message_handler(cmd_prof,     commands=["prof"],                pass_bot=False)
 bot.register_message_handler(
     cmd_unknown,
     func=lambda m: m.text and m.text.startswith("/"),

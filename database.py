@@ -171,6 +171,30 @@ def init_db():
                 )
             """)
 
+            # Links a relay batch (the copies of one piece of media delivered
+            # to every recipient) back to the time reward it earned its
+            # sender. This is what lets /delete tell an admin exactly how
+            # much time to reverse when a media message is removed.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS media_rewards (
+                    batch_id      TEXT    PRIMARY KEY,
+                    sender_uid    BIGINT  NOT NULL,
+                    media_type    TEXT    NOT NULL,
+                    earned_secs   INTEGER NOT NULL,
+                    created_at    TEXT    NOT NULL
+                )
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_media_rewards_sender "
+                "ON media_rewards(sender_uid)"
+            )
+
+            # Case-insensitive username lookups power /prof <username>.
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_users_username_lower "
+                "ON users (LOWER(username))"
+            )
+
             # ── Ensure main admin exists ──────────────────────────────────────
             cur.execute("""
                 INSERT INTO users
@@ -245,6 +269,24 @@ def upsert_user(uid, username, referral_code=None):
 
             conn.commit()
             return rid, True
+        finally:
+            conn.close()
+
+
+def get_user_by_username(username: str):
+    """Case-insensitive lookup used by /prof <username>. `username` should be
+    passed without a leading '@'."""
+    if not username:
+        return None
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT * FROM users WHERE username != '' AND LOWER(username)=LOWER(%s)",
+                (username,),
+            )
+            return cur.fetchone()
         finally:
             conn.close()
 
@@ -537,6 +579,39 @@ def add_access_time_returning_was_expired(uid, seconds: int) -> bool:
             conn.close()
 
 
+def subtract_access_time(uid, seconds: int) -> int:
+    """
+    Subtract `seconds` from a user's access_until timestamp — the inverse of
+    add_access_time(). Used to reverse a time reward (e.g. an admin deletes
+    the media that earned it) or to let an admin manually dock balance.
+    Returns the user's new remaining access seconds (0 if that's now in the
+    past, same convention as get_access_seconds()).
+    """
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT access_until FROM users WHERE user_id=%s", (uid,))
+            row = cur.fetchone()
+            if not row or not row["access_until"]:
+                return 0
+            try:
+                cur_t = datetime.fromisoformat(row["access_until"])
+                if cur_t.tzinfo is None:
+                    cur_t = cur_t.replace(tzinfo=timezone.utc)
+            except Exception:
+                return 0
+            new_until = cur_t - timedelta(seconds=seconds)
+            cur.execute(
+                "UPDATE users SET access_until=%s WHERE user_id=%s",
+                (new_until.isoformat(), uid),
+            )
+            conn.commit()
+            return max(0, int((new_until - datetime.now(timezone.utc)).total_seconds()))
+        finally:
+            conn.close()
+
+
 def has_access(uid) -> bool:
     return is_admin(uid) or get_access_seconds(uid) > 0
 
@@ -776,6 +851,62 @@ def cleanup_old_relay_log():
         try:
             cur = conn.cursor()
             cur.execute("DELETE FROM relay_log WHERE sent_at<%s", (cutoff,))
+            # Keep media_rewards in lockstep with relay_log — once a batch's
+            # relay copies are gone there's nothing left for /delete to act
+            # on, so its reward record is just dead weight.
+            cur.execute("DELETE FROM media_rewards WHERE created_at<%s", (cutoff,))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+# ── Media reward helpers ──────────────────────────────────────────────────────
+# Ties a relay batch to the time reward its sender earned for it, so /delete
+# can report and reverse the exact amount when that media is removed.
+
+def record_media_reward(batch_id, sender_uid, media_type, earned_secs):
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO media_rewards (batch_id, sender_uid, media_type, earned_secs, created_at) "
+                "VALUES (%s,%s,%s,%s,%s) ON CONFLICT (batch_id) DO NOTHING",
+                (batch_id, sender_uid, media_type, earned_secs, _now()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def get_media_reward(batch_id):
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM media_rewards WHERE batch_id=%s", (batch_id,))
+            return cur.fetchone()
+        finally:
+            conn.close()
+
+
+def delete_media_reward(batch_id):
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM media_rewards WHERE batch_id=%s", (batch_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def delete_media_rewards_all():
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM media_rewards")
             conn.commit()
         finally:
             conn.close()
