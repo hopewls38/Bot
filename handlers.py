@@ -18,7 +18,7 @@ from config import (
     SMALL_VIDEO_STREAK_LIMIT,
 )
 from database import (
-    get_user, get_user_by_username, upsert_user, set_display_name, touch_user,
+    get_user, get_user_by_username, get_user_by_bot_username, upsert_user, set_display_name, touch_user,
     ban_user, unban_user,
     deactivate_user, set_mute, clear_mute, set_role, active_users, all_reachable_users,
     all_users_paged,
@@ -37,7 +37,7 @@ from database import (
 from utils import (
     md, fmt_time, time_bar, parse_duration, parse_del_time,
     user_info_text, admin_panel_text, media_settings_text,
-    broadcast_message_text, strip_links,
+    broadcast_message_text, strip_links, contains_link,
     mute_builder_text, usage_time_builder_text,
 )
 from keyboards import (
@@ -616,7 +616,8 @@ def _help_text(is_adm: bool) -> str:
             "🛡 *Admin Commands*\n"
             "`/admin` — admin panel\n"
             "`/users` — user list\n"
-            "`/prof username` · `/prof` (reply) — open a user's profile panel\n"
+            "`/prof name_or_id` · `/prof` (reply) — open a user's profile panel "
+            "(bot display name/ID, not their Telegram @username)\n"
             "`/ban [reason]` — ban (reply to message)\n"
             "`/unban` — unban user\n"
             "`/mute 10min [reason]` — mute with duration\n"
@@ -1187,7 +1188,9 @@ def cmd_delete(msg: types.Message):
 def cmd_prof(msg: types.Message):
     """
     Open a user's admin profile panel two ways besides the Users list:
-      /prof username   — look up by @username
+      /prof username   — look up by the user's bot-assigned identity
+                         (their display name, or their bot ID if they never
+                         set one) — NOT their Telegram @username.
       (reply) /prof     — look up the sender of the relayed message replied to
     """
     if not is_admin(msg.from_user.id):
@@ -1203,14 +1206,15 @@ def cmd_prof(msg: types.Message):
         if not uname:
             bot.reply_to(msg,
                 "Usage:\n"
-                "`/prof username` — view a profile by username\n"
+                "`/prof username` — view a profile by the user's bot name/ID "
+                "(not their Telegram @username)\n"
                 "Or reply to a relayed message with `/prof`.",
                 parse_mode="Markdown",
             )
             return
-        u = get_user_by_username(uname)
+        u = get_user_by_bot_username(uname)
         if not u:
-            bot.reply_to(msg, f"❌ No user found with username @{md(uname)}.", parse_mode="Markdown")
+            bot.reply_to(msg, f"❌ No user found with bot name/ID *{md(uname)}*.", parse_mode="Markdown")
             return
         target_uid = u["user_id"]
     elif msg.reply_to_message:
@@ -1222,7 +1226,8 @@ def cmd_prof(msg: types.Message):
     else:
         bot.reply_to(msg,
             "Usage:\n"
-            "`/prof username` — view a profile by username\n"
+            "`/prof username` — view a profile by the user's bot name/ID "
+            "(not their Telegram @username)\n"
             "Or reply to a relayed message with `/prof`.",
             parse_mode="Markdown",
         )
@@ -2358,6 +2363,24 @@ def handle_message(msg: types.Message):
         bot.reply_to(msg, f"❌ {err}")
         return
 
+    # ── Link filtering ──────────────────────────────────────────────────────────
+    # Plain text messages that contain a link are blocked outright — nothing is
+    # relayed, and the sender is told why.
+    if msg.text and contains_link(msg.text):
+        bot.reply_to(msg,
+            "🚫 *Links are not allowed.*\n\n"
+            "Your message contained a link, so it was not sent to the network.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # A link inside a photo/video caption isn't blocked outright — the caption
+    # is relayed with the link stripped out (see strip_links() in _relay_to).
+    # We just need to remember it happened so we can tell the sender below.
+    caption_link_removed = bool(
+        msg.caption and (msg.photo or msg.video) and contains_link(msg.caption)
+    )
+
     # ── Automatic media backup (non-blocking) ─────────────────────────────────
     if has_media:
         backup_message_media(bot, msg, uid)
@@ -2373,6 +2396,13 @@ def handle_message(msg: types.Message):
         args=(uid, msg.chat.id, msg, targets, batch_id),
         daemon=True,
     ).start()
+
+    if caption_link_removed:
+        _safe(bot.reply_to, msg,
+              "⚠️ *Link removed*\n\n"
+              "Your caption contained a link, so it was removed before your "
+              "photo/video was relayed to the network.",
+              parse_mode="Markdown", target_uid=uid)
 
     # Confirmation for admins (regular users already see time-earn replies)
     if is_admin(uid):

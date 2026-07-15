@@ -274,8 +274,9 @@ def upsert_user(uid, username, referral_code=None):
 
 
 def get_user_by_username(username: str):
-    """Case-insensitive lookup used by /prof <username>. `username` should be
-    passed without a leading '@'."""
+    """Case-insensitive lookup by the user's *Telegram* username. `username`
+    should be passed without a leading '@'. Not used by /prof — see
+    get_user_by_bot_username() for the bot-assigned identity lookup."""
     if not username:
         return None
     with _db_lock:
@@ -285,6 +286,36 @@ def get_user_by_username(username: str):
             cur.execute(
                 "SELECT * FROM users WHERE username != '' AND LOWER(username)=LOWER(%s)",
                 (username,),
+            )
+            return cur.fetchone()
+        finally:
+            conn.close()
+
+
+def get_user_by_bot_username(name: str):
+    """Case-insensitive lookup used by /prof <username>.
+
+    `name` refers to the identity the bot itself gave the user — never their
+    Telegram @username. It matches, in order:
+      1. Their bot display name (display_name — set via Profile → Set Name).
+      2. Their bot ID (random_id — the `🆔 ID:` shown on their profile).
+    """
+    if not name:
+        return None
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT * FROM users WHERE display_name != '' AND LOWER(display_name)=LOWER(%s)",
+                (name,),
+            )
+            row = cur.fetchone()
+            if row:
+                return row
+            cur.execute(
+                "SELECT * FROM users WHERE LOWER(random_id)=LOWER(%s)",
+                (name,),
             )
             return cur.fetchone()
         finally:

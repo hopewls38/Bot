@@ -105,6 +105,13 @@ _URL_RE = re.compile(
 )
 
 
+def contains_link(text: str) -> bool:
+    """Return True if `text` contains anything that looks like a link/URL."""
+    if not text:
+        return False
+    return _URL_RE.search(text) is not None
+
+
 def strip_links(text: str) -> str:
     """
     Remove URLs/links from a block of text (used for photo/video captions),

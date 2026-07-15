@@ -38,7 +38,7 @@ MEDIA_FIELDS = frozenset({
 
 # ── Welcome media ────────────────────────────────────────────────────────────
 # How many cached welcome media items are sent to a brand-new user.
-WELCOME_MEDIA_COUNT = 10
+WELCOME_MEDIA_COUNT = 5
 
 # ── Performance ──────────────────────────────────────────────────────────────
 # Number of worker threads used to fan a single message out to many chats at
