@@ -22,11 +22,12 @@ log = logging.getLogger("relay")
 def user_main_keyboard():
     """
     Primary menu shown after /start.
-    Four clean sections — Profile, Referral, Leave, Help.
+    Five clean sections — Profile, Referral, Feedback, Leave, Help.
     """
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("👤   Profile",          callback_data="profile:show"))
     kb.add(types.InlineKeyboardButton("🔗   Referral Link",    callback_data="ref:link"))
+    kb.add(types.InlineKeyboardButton("💬   Contact Admin",    callback_data="user:feedback"))
     kb.add(types.InlineKeyboardButton("🚪   Leave Network",    callback_data="user:leave"))
     kb.add(types.InlineKeyboardButton("❓   Help",             callback_data="user:help"))
     return kb
@@ -79,10 +80,20 @@ def user_time_keyboard_refresh():
 
 
 def referral_keyboard():
+    """
+    Keyboard shown on the Referral Link page.
+    Includes a dedicated Copy Link button — tapping it shows an alert popup
+    with the raw link text so the user can long-press/copy on any platform.
+    """
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
-        types.InlineKeyboardButton("🔄 Refresh Stats",    callback_data="ref:stats"),
-        types.InlineKeyboardButton("🔙 Back to Menu",     callback_data="user:menu"),
+        types.InlineKeyboardButton("📋 Copy Referral Link",  callback_data="ref:copy"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🔄 Refresh Stats",       callback_data="ref:stats"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🔙 Back to Menu",        callback_data="user:menu"),
     )
     return kb
 
@@ -108,6 +119,9 @@ def admin_keyboard(uid):
         kb.add(
             types.InlineKeyboardButton("🎬 Welcome Media",  callback_data="welcome:start"),
             types.InlineKeyboardButton("📢 Broadcast",       callback_data="broadcast:start"),
+        )
+        kb.add(
+            types.InlineKeyboardButton("🎁 Gift 24h (Expired)", callback_data="admin:gift24h"),
         )
     kb.add(types.InlineKeyboardButton("🔃 Refresh Panel", callback_data="admin:back"))
     return kb
@@ -330,6 +344,21 @@ def backups_keyboard():
     kb.add(
         types.InlineKeyboardButton("🔄 Refresh Count", callback_data="admin:backups"),
         types.InlineKeyboardButton("🔙 Back",           callback_data="admin:back"),
+    )
+    return kb
+
+
+# ── Gift 24h confirmation keyboard ────────────────────────────────────────────
+
+def gift24h_confirm_keyboard(expired_count: int):
+    """Confirmation dialog before gifting 24h to all expired users."""
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton(
+            f"✅ Yes — Gift {expired_count} user(s)",
+            callback_data="admin:gift24h:confirm",
+        ),
+        types.InlineKeyboardButton("❌ Cancel", callback_data="admin:back"),
     )
     return kb
 

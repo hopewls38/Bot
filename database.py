@@ -171,6 +171,22 @@ def init_db():
                 )
             """)
 
+            # Tracks which welcome-media items each user has already received
+            # so consecutive "welcome back" batches never repeat the same clip.
+            # When a user has seen every item the pool resets automatically.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_welcome_media_seen (
+                    user_id   BIGINT  NOT NULL,
+                    media_id  INTEGER NOT NULL,
+                    seen_at   TEXT    NOT NULL,
+                    PRIMARY KEY (user_id, media_id)
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_uwms_user
+                ON user_welcome_media_seen(user_id)
+            """)
+
             # Links a relay batch (the copies of one piece of media delivered
             # to every recipient) back to the time reward it earned its
             # sender. This is what lets /delete tell an admin exactly how
@@ -524,6 +540,20 @@ def is_admin(uid) -> bool:
 
 def is_main_admin(uid) -> bool:
     return uid == MAIN_ADMIN_ID
+
+
+def get_all_admin_ids() -> list:
+    """Return user_ids for all active admins (role >= 1, not banned)."""
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT user_id FROM users WHERE role >= 1 AND is_banned=0 AND active=1"
+            )
+            return [r["user_id"] for r in cur.fetchall()]
+        finally:
+            conn.close()
 
 
 # ── Time-access helpers ───────────────────────────────────────────────────────
@@ -1209,6 +1239,7 @@ def count_welcome_media() -> int:
 
 
 def get_random_welcome_media(limit: int):
+    """Legacy: pick `limit` random items globally (no per-user dedup)."""
     with _db_lock:
         conn = _conn()
         try:
@@ -1223,12 +1254,79 @@ def get_random_welcome_media(limit: int):
             conn.close()
 
 
+def get_random_welcome_media_for_user(uid: int, limit: int):
+    """
+    Pick up to `limit` welcome-media items the user has NOT already received.
+    If fewer than `limit` unseen items remain, the user's seen-list is reset
+    first so the pool starts fresh — they never get stuck with no videos.
+    Returns a list of dicts with keys: id, file_id, file_type.
+    """
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+
+            # How many unseen items are there for this user?
+            cur.execute(
+                "SELECT COUNT(*) as cnt FROM welcome_media wm "
+                "WHERE NOT EXISTS ("
+                "  SELECT 1 FROM user_welcome_media_seen s "
+                "  WHERE s.user_id=%s AND s.media_id=wm.id"
+                ")",
+                (uid,),
+            )
+            unseen_count = cur.fetchone()["cnt"]
+
+            # If fewer unseen items than we need, wipe the history so we
+            # recycle the full pool rather than sending duplicates.
+            if unseen_count < limit:
+                cur.execute(
+                    "DELETE FROM user_welcome_media_seen WHERE user_id=%s", (uid,)
+                )
+                conn.commit()
+
+            # Pick `limit` items user hasn't seen (after potential reset).
+            cur.execute(
+                "SELECT id, file_id, file_type FROM welcome_media wm "
+                "WHERE NOT EXISTS ("
+                "  SELECT 1 FROM user_welcome_media_seen s "
+                "  WHERE s.user_id=%s AND s.media_id=wm.id"
+                ") ORDER BY RANDOM() LIMIT %s",
+                (uid, limit),
+            )
+            return cur.fetchall()
+        finally:
+            conn.close()
+
+
+def record_welcome_media_seen(uid: int, media_ids: list):
+    """Mark a list of welcome_media.id values as seen for this user."""
+    if not media_ids:
+        return
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            now = _now()
+            for mid in media_ids:
+                cur.execute(
+                    "INSERT INTO user_welcome_media_seen (user_id, media_id, seen_at) "
+                    "VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
+                    (uid, mid, now),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+
 def clear_welcome_media():
     with _db_lock:
         conn = _conn()
         try:
             cur = conn.cursor()
             cur.execute("DELETE FROM welcome_media")
+            # Also wipe the seen-history — it references IDs that no longer exist.
+            cur.execute("DELETE FROM user_welcome_media_seen")
             conn.commit()
         finally:
             conn.close()
