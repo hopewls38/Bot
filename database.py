@@ -770,14 +770,14 @@ def get_eligible_active_count() -> int:
 
 
 def get_expired_users():
-    """Non-admin, in-network, not banned/muted users whose access time is up."""
+    """Non-admin, not banned/muted users whose access time is up (includes inactive users)."""
     with _db_lock:
         conn = _conn()
         try:
             cur = conn.cursor()
             now = _now()
             cur.execute(
-                "SELECT * FROM users WHERE active=1 AND is_banned=0 AND role=0 "
+                "SELECT * FROM users WHERE is_banned=0 AND role=0 "
                 "AND (muted_until IS NULL OR muted_until <= %s) "
                 "AND (access_until IS NULL OR access_until <= %s)",
                 (now, now),
