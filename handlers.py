@@ -2220,11 +2220,10 @@ def on_callback(call: types.CallbackQuery):
             _awaiting[uid] = {"action": "feedback_compose"}
         bot.answer_callback_query(call.id)
         bot.send_message(
-            uid,
+uid,
             "💬 *Contact Admin*\n"
             "━━━━━━━━━━━━━━━━━\n\n"
-            "Type your message below — it will be sent directly to all admins.\n"
-            "Your profile information will be included so they can respond to you.\n\n"
+            "Type your message below — it will be sent directly to all admins.\n\n"
             "_Write anything: feedback, questions, or reports._",
             parse_mode="Markdown",
         )
