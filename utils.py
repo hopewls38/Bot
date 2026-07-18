@@ -45,7 +45,6 @@ def time_bar(seconds: int, total: int = GRACE_SECONDS) -> str:
 
 # ── Duration parsing ──────────────────────────────────────────────────────────
 
-# Matches: 10min, 2h, 1d, 30s, 1.5h, etc.
 _DURATION_RE = re.compile(
     r"(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds"
     r"|m|min|mins|minute|minutes"
@@ -56,10 +55,7 @@ _DURATION_RE = re.compile(
 
 
 def parse_duration(text: str):
-    """
-    Parse a human duration string and return total seconds, or None if invalid.
-    Accepts compound strings like "1h30min" or single tokens like "2h", "10min", "1d".
-    """
+    """Parse a human duration string and return total seconds, or None if invalid."""
     text = text.strip()
     matches = _DURATION_RE.findall(text)
     if not matches:
@@ -95,9 +91,9 @@ def parse_del_time(arg: str):
 # ── Link stripping ────────────────────────────────────────────────────────────
 
 _URL_RE = re.compile(
-    r"(?:https?://\S+"                     # http:// or https:// links
-    r"|www\.\S+"                           # www. links
-    r"|t\.me/\S+"                          # Telegram invite/links
+    r"(?:https?://\S+"
+    r"|www\.\S+"
+    r"|t\.me/\S+"
     r"|(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+"
     r"(?:com|net|org|io|me|co|info|biz|xyz|ru|ir|tv|link|club|site|online|"
     r"shop|store|app|dev|gg|cc|to|us|uk|ca)\b(?:/\S*)?)",
@@ -106,22 +102,15 @@ _URL_RE = re.compile(
 
 
 def contains_link(text: str) -> bool:
-    """Return True if `text` contains anything that looks like a link/URL."""
     if not text:
         return False
     return _URL_RE.search(text) is not None
 
 
 def strip_links(text: str) -> str:
-    """
-    Remove URLs/links from a block of text (used for photo/video captions),
-    leaving the rest of the text intact. Collapses extra whitespace left
-    behind after removal.
-    """
     if not text:
         return text
     cleaned = _URL_RE.sub("", text)
-    # Collapse repeated blank lines / spaces created by the removal.
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
@@ -130,26 +119,35 @@ def strip_links(text: str) -> str:
 # ── User info text builders ───────────────────────────────────────────────────
 
 def user_info_text(u, ref_count: int = 0, media_count: int = 0) -> str:
+    from database import _row_access_secs, _row_is_unlimited
     name      = u["display_name"] or u["random_id"]
     raw_uname = u["username"] if u["username"] else ""
     uname     = f"@{raw_uname}" if raw_uname else "—"
-    role_str  = (
-        "👑 Main Admin" if u["role"] >= 2
-        else "🛡️ Admin"   if u["role"] >= 1
-        else "👤 User"
-    )
+
+    if u["role"] >= 2:
+        role_str = "👑 Main Admin"
+    elif u["role"] >= 1:
+        role_str = "🛡️ Admin"
+    elif _row_is_unlimited(u):
+        role_str = "♾️ User (Unlimited)"
+    else:
+        role_str = "👤 User"
+
     status_str = (
         "🔴 Banned"    if u["is_banned"]
         else "💤 Inactive" if not u["active"]
         else "🟢 Active"
     )
+
     if u["role"] >= 1:
-        time_str = "Unlimited"
+        time_str = "∞ Unlimited (Admin)"
+        bar_str  = ""
+    elif _row_is_unlimited(u):
+        time_str = "♾️ Unlimited (Gifted)"
         bar_str  = ""
     else:
-        from database import _row_access_secs
         secs     = _row_access_secs(u)
-        time_str = fmt_time(secs) if secs > 0 else "Expired"
+        time_str = fmt_time(secs) if secs > 0 else "⌛ Expired"
         bar_str  = f"\n`{time_bar(secs)}`"
 
     joined = (u["joined_at"] or "")[:10] or "—"
@@ -175,6 +173,7 @@ def user_info_text(u, ref_count: int = 0, media_count: int = 0) -> str:
 
 
 def admin_panel_text(s) -> str:
+    unlimited_line = f"\n♾️ Unlimited users:   *{s.get('unlimited', 0)}*" if s.get('unlimited', 0) > 0 else ""
     return (
         "🛡 *Admin Panel*\n"
         "━━━━━━━━━━━━━━━━━\n\n"
@@ -184,7 +183,8 @@ def admin_panel_text(s) -> str:
         f"⏳ Expired (no time): *{s.get('expired', 0)}*\n"
         f"🔴 Banned:            *{s['banned']}*\n"
         f"🕐 Active (24h):      *{s['recent_24h']}*\n"
-        f"🛡 Admins:            *{s['admins']}*\n"
+        f"🛡 Admins:            *{s['admins']}*"
+        f"{unlimited_line}\n"
         f"💾 Media backups:     *{s.get('backups', 0)}*\n"
         f"🔗 Referrals:         *{s.get('referrals', 0)}*\n"
         "━━━━━━━━━━━━━━━━━"
@@ -206,7 +206,6 @@ def media_settings_text(ms) -> str:
 
 
 def mute_duration_text(seconds: int) -> str:
-    """Human-readable mute duration for notifications."""
     return fmt_time(seconds)
 
 
@@ -214,7 +213,6 @@ _UNIT_TO_SECS = {"s": 1, "m": 60, "h": 3600}
 
 
 def mute_builder_text(u, unit: str, value: int) -> str:
-    """Header shown above the nested mute-duration builder keyboard."""
     name = (u["display_name"] or u["random_id"]) if u else "Unknown"
     secs = value * _UNIT_TO_SECS.get(unit, 1)
     return (
@@ -227,7 +225,6 @@ def mute_builder_text(u, unit: str, value: int) -> str:
 
 
 def usage_time_builder_text(u, direction: str, unit: str, value: int) -> str:
-    """Header shown above the nested usage-time builder keyboard."""
     name = (u["display_name"] or u["random_id"]) if u else "Unknown"
     secs = value * (60 if unit == "m" else 3600)
     verb = "Increase" if direction == "add" else "Decrease"
@@ -253,17 +250,10 @@ for _i, _c in enumerate("0123456789"):
 
 
 def to_big_bold(text: str) -> str:
-    """
-    Convert plain ASCII text to Unicode Mathematical Bold characters.
-    Unlike Markdown '*bold*', this renders as visibly larger/bolder text on
-    every Telegram client and notification preview, regardless of parse mode.
-    Non-Latin characters (e.g. emoji, punctuation) pass through unchanged.
-    """
     return "".join(_BOLD_MAP.get(ch, ch) for ch in text)
 
 
 def broadcast_message_text(body: str) -> str:
-    """Build an eye-catching admin broadcast with attention emojis and large font."""
     big = to_big_bold(body.strip())
     return (
         "📢🔔📢 " + to_big_bold("ANNOUNCEMENT") + " 📢🔔📢\n"

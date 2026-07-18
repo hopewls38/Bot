@@ -24,7 +24,8 @@ from database import (
     all_users_paged,
     is_admin, is_main_admin, get_access_seconds, add_access_time, has_access,
     add_access_time_returning_was_expired, subtract_access_time,
-    _row_has_access, _row_access_secs, user_count, stats,
+    _row_has_access, _row_access_secs, _row_is_unlimited, set_unlimited_access,
+    user_count, stats,
     get_batch_by_msg, get_batch_msgs, get_all_relay_msgs,
     delete_relay_log_all, delete_relay_log_batch, log_relay,
     get_media_settings, set_media_field, is_muted, _row_is_muted, mute_remaining_secs,
@@ -50,6 +51,8 @@ from keyboards import (
     welcome_collect_keyboard, remove_keyboard,
     mute_builder_keyboard, usage_time_builder_keyboard,
     gift24h_confirm_keyboard,
+    feedback_confirm_keyboard, admin_feedback_keyboard,
+    admin_feedback_read_keyboard, admin_reply_confirm_keyboard,
     MUTE_UNIT_CYCLE,
 )
 from backup_manager import backup_message_media, is_duplicate_media
@@ -63,16 +66,20 @@ _spam_lock  = threading.Lock()
 _awaiting   = {}
 _awaiting_lock = threading.Lock()
 
-# Holds a composed-but-unsent direct message per admin uid — {"target": int,
-# "text": str} — while they review the Send/Cancel preview. Kept separate
-# from _awaiting (which only tracks "waiting for the next text message").
+# Holds a composed-but-unsent direct message per admin uid while they review
+# the Send/Cancel preview.
 _dm_pending      = {}
 _dm_pending_lock = threading.Lock()
 
-# ── Mute / usage-time builder step sizes ───────────────────────────────────
-# All state for these nested keyboards travels in the callback_data itself
-# (target, unit, value) — no server-side session needed, so there's nothing
-# to go stale if an admin walks away mid-flow.
+# Holds pending user feedback awaiting send confirmation: {uid: {"text": str}}
+_feedback_pending      = {}
+_feedback_pending_lock = threading.Lock()
+
+# Holds pending admin replies to user feedback: {admin_uid: {"target": int, "text": str}}
+_reply_pending      = {}
+_reply_pending_lock = threading.Lock()
+
+# ── Mute / usage-time builder step sizes ──────────────────────────────────────
 _MUTE_STEP = {"s": 10, "m": 5, "h": 1}
 _MUTE_MIN  = {"s": 10, "m": 1, "h": 1}
 _MUTE_MAX  = {"s": 3600, "m": 1440, "h": 720}
@@ -92,15 +99,14 @@ def _clamp_ut_val(unit, val):
 
 _del_lock        = threading.Lock()
 _del_running     = False
-_del_cancel_evt  = threading.Event()   # set() → cancels the pending deletion
-_shutdown   = threading.Event()
+_del_cancel_evt  = threading.Event()
+_shutdown        = threading.Event()
 
-# Admins currently in "collect welcome media" mode (in-memory, ephemeral).
+# Admins currently in "collect welcome media" mode.
 _collecting_welcome      = set()
 _collecting_welcome_lock = threading.Lock()
 
-# Tracks each user's current streak of consecutive small videos (in-memory,
-# ephemeral) — used to trigger the small-video spam warning below.
+# Tracks each user's current streak of consecutive small videos.
 _small_video_streak      = {}
 _small_video_streak_lock = threading.Lock()
 
@@ -115,11 +121,7 @@ bot: telebot.TeleBot = None   # injected by main.py
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _safe(fn, *args, target_uid=None, **kwargs):
-    """
-    Run a Telegram API call, transparently handling flood-control (429) with
-    a single retry, and auto-deactivating users whose chat has gone dead
-    (blocked/left/deleted) so future broadcasts skip them.
-    """
+    """Run a Telegram API call with flood-control retry and auto-deactivation."""
     try:
         return fn(*args, **kwargs)
     except telebot.apihelper.ApiTelegramException as e:
@@ -154,12 +156,7 @@ def _safe(fn, *args, target_uid=None, **kwargs):
 
 
 def _parallel_dispatch(items, worker_fn, max_workers=RELAY_WORKERS):
-    """
-    Run worker_fn(item) for every item concurrently instead of sequentially.
-    This is what makes broadcast/relay/welcome-media fan-out fast — no more
-    one-message-at-a-time-with-a-sleep. Exceptions in a worker are swallowed
-    (workers already use _safe internally) so one bad chat never stops the rest.
-    """
+    """Run worker_fn(item) for every item concurrently."""
     items = list(items)
     if not items:
         return
@@ -173,14 +170,9 @@ def _parallel_dispatch(items, worker_fn, max_workers=RELAY_WORKERS):
 
 
 def _is_eligible_recipient(user_row) -> bool:
-    """
-    True if a user should currently receive relayed/broadcast media —
-    banned, muted, or access-expired users are treated as if they left chat.
-    """
+    """True if a user should currently receive relayed/broadcast media."""
     if not user_row or user_row["is_banned"] or not user_row["active"]:
         return False
-    # Row-based check (no extra DB call per recipient) — matters when this
-    # runs across an entire relay/broadcast target list.
     if _row_is_muted(user_row):
         return False
     return _row_has_access(user_row)
@@ -211,6 +203,14 @@ def prune_memory_state():
         if len(_dm_pending) > 1000:
             _dm_pending.clear()
             log.warning("Cleared _dm_pending state: exceeded safety cap")
+    with _feedback_pending_lock:
+        if len(_feedback_pending) > 1000:
+            _feedback_pending.clear()
+            log.warning("Cleared _feedback_pending state: exceeded safety cap")
+    with _reply_pending_lock:
+        if len(_reply_pending) > 1000:
+            _reply_pending.clear()
+            log.warning("Cleared _reply_pending state: exceeded safety cap")
     with _small_video_streak_lock:
         if len(_small_video_streak) > 2000:
             _small_video_streak.clear()
@@ -261,16 +261,6 @@ def _relay_to(source_chat_id, message, target_uid, prefix) -> list:
 
 
 def relay_message(sender_uid, source_chat_id, message, targets=None, batch_id=None):
-    """
-    targets, if given, must already be filtered to eligible recipients
-    (see _is_eligible_recipient) — handle_message pre-computes this so the
-    "Relayed to N member(s)" confirmation always matches who actually got it.
-    If omitted, targets are looked up and filtered here instead.
-
-    batch_id, if given, is used instead of generating a fresh one — this is
-    how handle_message links a relay batch back to the media_rewards row it
-    recorded for the earned time, so /delete can find and reverse it later.
-    """
     try:
         sender  = get_user(sender_uid)
         if sender is None:
@@ -293,8 +283,6 @@ def relay_message(sender_uid, source_chat_id, message, targets=None, batch_id=No
             for mid in mids:
                 log_relay(batch, sender_uid, tid, mid)
 
-        # Fan the message out to every recipient concurrently instead of one
-        # at a time — this is the main relay speed-up.
         _parallel_dispatch(targets, _send_one)
     except Exception as e:
         log.error("relay_message crashed (sender=%s): %s", sender_uid, e, exc_info=True)
@@ -303,7 +291,6 @@ def relay_message(sender_uid, source_chat_id, message, targets=None, batch_id=No
 # ── Notification helpers ──────────────────────────────────────────────────────
 
 def _notify_unmuted(target_uid):
-    """Send the unmuted user a private notification."""
     _safe(bot.send_message, target_uid,
           "🔊 *You have been unmuted*\n"
           "━━━━━━━━━━━━━━━━━\n\n"
@@ -312,7 +299,6 @@ def _notify_unmuted(target_uid):
 
 
 def _notify_unbanned(target_uid):
-    """Send the unbanned user a private notification."""
     _safe(bot.send_message, target_uid,
           "🟢 *You have been unbanned*\n"
           "━━━━━━━━━━━━━━━━━\n\n"
@@ -322,7 +308,6 @@ def _notify_unbanned(target_uid):
 
 
 def _notify_muted(target_uid, duration_secs: int, reason: str = None):
-    """Send the muted user a private notification."""
     dur_str = fmt_time(duration_secs)
     text = (
         "🔇 *You have been muted*\n"
@@ -337,7 +322,6 @@ def _notify_muted(target_uid, duration_secs: int, reason: str = None):
 
 
 def _notify_banned(target_uid, reason: str = None):
-    """Send the banned user a private notification."""
     text = (
         "🚫 *You have been banned*\n"
         "━━━━━━━━━━━━━━━━━\n\n"
@@ -351,11 +335,7 @@ def _notify_banned(target_uid, reason: str = None):
 
 
 def _notify_direct_message(target_uid, text: str):
-    """
-    Deliver an admin's direct message. Distinctly framed as a personal note
-    from staff — not part of the anonymous relay network — via an English
-    header that also serves as the push-notification preview.
-    """
+    """Deliver an admin's direct message to a user."""
     _safe(bot.send_message, target_uid,
           "🔔 *Direct Message From Admin*\n"
           "━━━━━━━━━━━━━━━━━\n\n"
@@ -365,8 +345,27 @@ def _notify_direct_message(target_uid, text: str):
           parse_mode="Markdown", target_uid=target_uid)
 
 
+def _notify_admin_read(target_uid):
+    """Tell the user that an admin has read their message."""
+    _safe(bot.send_message, target_uid,
+          "👁 *Your message was read*\n"
+          "━━━━━━━━━━━━━━━━━\n\n"
+          "An admin has read your message.\n"
+          "If a response is needed, you will receive a direct reply shortly.",
+          parse_mode="Markdown", target_uid=target_uid)
+
+
+def _notify_admin_reply(target_uid, reply_text: str):
+    """Send an admin's reply to the user who originally sent feedback."""
+    _safe(bot.send_message, target_uid,
+          "💬 *Reply from Admin*\n"
+          "━━━━━━━━━━━━━━━━━\n\n"
+          f"{md(reply_text)}\n\n"
+          "_This is a direct reply to your message — it is not part of the shared network chat._",
+          parse_mode="Markdown", target_uid=target_uid)
+
+
 def _notify_media_deleted(target_uid, media_type: str, secs: int, new_balance: int):
-    """Tell the sender their media was removed and how much reward was reversed."""
     label = {"photo": "photo", "video": "video"}.get(media_type, "media")
     _safe(bot.send_message, target_uid,
           "🗑 *Your media was removed*\n"
@@ -379,7 +378,6 @@ def _notify_media_deleted(target_uid, media_type: str, secs: int, new_balance: i
 
 
 def _notify_time_adjusted(target_uid, direction: str, secs: int, new_balance: int):
-    """Tell a user an admin manually added/removed usage time via the profile panel."""
     if direction == "add":
         text = (
             "⏰ *Time Added!*\n"
@@ -400,30 +398,30 @@ def _notify_time_adjusted(target_uid, direction: str, secs: int, new_balance: in
           target_uid=target_uid)
 
 
-# ── Welcome media (new-user greeting) ─────────────────────────────────────────
+def _notify_unlimited(target_uid):
+    """
+    Special notification sent to a user when an admin grants them unlimited access.
+    Rich, celebratory message that makes it feel like a meaningful gift.
+    """
+    _safe(bot.send_message, target_uid,
+          "♾️ *Unlimited Access Granted!*\n"
+          "━━━━━━━━━━━━━━━━━\n\n"
+          "🎉 Congratulations! An admin has granted you *permanent, unlimited access* to NightVi.\n\n"
+          "✨ Your account will *never expire*. No more sending media to earn time — "
+          "you have full, unrestricted access forever.\n\n"
+          "Thank you for being part of the community! 🌙",
+          parse_mode="Markdown", target_uid=target_uid)
+
+
+# ── Welcome media ─────────────────────────────────────────────────────────────
 
 def _send_welcome_media(uid: int, intro_caption: str = "🎬 A few welcome clips just for you — enjoy!"):
-    """
-    Send up to WELCOME_MEDIA_COUNT randomly-picked cached welcome media items
-    to a user, picking only clips they haven't received before (per-user dedup).
-    If they've seen everything, their history is reset and the full pool
-    becomes available again — so they never run out of content.
-
-    Used both for brand-new users (/start) and for previously-expired users
-    who come back and send media again (see the "welcome back" hook in
-    handle_message). Only `file_id`s are stored/used, so nothing is ever
-    downloaded — sending is just as cheap on RAM/bandwidth as the relay's
-    own copy_message calls.
-    """
     try:
         items = get_random_welcome_media_for_user(uid, WELCOME_MEDIA_COUNT)
         if not items:
             return
         items = list(items)
         random.shuffle(items)
-
-        # Record these IDs as seen before sending — if the send partially
-        # fails, the user at least won't get the same clip twice next time.
         seen_ids = [item["id"] for item in items]
         record_welcome_media_seen(uid, seen_ids)
 
@@ -447,14 +445,6 @@ _greet_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="greet")
 
 
 def _greet_returning_user(uid: int):
-    """
-    A previously time-expired user just sent media and has a balance again —
-    treat them like a fresh /start: fire the same welcome-media batch, with
-    a "welcome back" caption instead of the new-user one.
-
-    Dispatched on a small, bounded executor (not a fresh thread per call) so
-    a burst of returning users can't spawn unbounded OS threads.
-    """
     _greet_executor.submit(
         _send_welcome_media,
         uid,
@@ -465,12 +455,6 @@ def _greet_returning_user(uid: int):
 # ── Expired-time reminders ────────────────────────────────────────────────────
 
 def remind_expired_users():
-    """
-    DM every user whose access time has run out (and who hasn't already been
-    reminded within EXPIRED_REMINDER_INTERVAL_SECS) with a nudge on how to
-    earn more time. Called from main.py's maintenance loop roughly every 6h.
-    Banned/muted/admin users are never selected by the underlying query.
-    """
     try:
         rows = get_users_needing_expired_reminder(EXPIRED_REMINDER_INTERVAL_SECS)
         if not rows:
@@ -491,8 +475,6 @@ def remind_expired_users():
             tid = u["user_id"]
             _safe(bot.send_message, tid, text, parse_mode="Markdown",
                   reply_markup=kb, target_uid=tid)
-            # Marked as sent even on failure — a dead chat gets deactivated by
-            # _safe anyway, and we never want a retry storm on stale rows.
             mark_expired_reminder_sent(tid)
 
         _parallel_dispatch(rows, _send_one, max_workers=min(RELAY_WORKERS, 4))
@@ -504,47 +486,35 @@ def remind_expired_users():
 # ── Referral reward helper ────────────────────────────────────────────────────
 
 def _process_referral_reward(new_uid: int):
-    """
-    Check if new_uid was referred by someone and grant rewards.
-    Called once after a brand-new user's first /start.
-    """
     ref_row = get_pending_referral(new_uid)
     if not ref_row:
         return
     referrer_id = ref_row["referrer_id"]
-
-    # Add +2 hours to both parties
     add_access_time(referrer_id, REFERRAL_REWARD_SECS)
     add_access_time(new_uid,     REFERRAL_REWARD_SECS)
     mark_referral_rewarded(ref_row["id"])
-
     ref_count = get_referral_count(referrer_id)
-    # Notify referrer
     _safe(bot.send_message, referrer_id,
           f"🎉 *Referral reward!*\n\n"
           f"Someone joined using your link.\n"
           f"⏰ *+{fmt_time(REFERRAL_REWARD_SECS)}* added to your balance!\n"
           f"🔗 Total successful referrals: *{ref_count}*",
           parse_mode="Markdown", target_uid=referrer_id)
-
-    # Notify new user
     _safe(bot.send_message, new_uid,
           f"🎉 *Welcome bonus!*\n\n"
           f"You joined via a referral link.\n"
           f"⏰ *+{fmt_time(REFERRAL_REWARD_SECS)}* added to your balance!",
           parse_mode="Markdown", target_uid=new_uid)
-
     log.info("Referral reward: referrer=%s referred=%s (+%ds each)",
              referrer_id, new_uid, REFERRAL_REWARD_SECS)
 
 
-# ── /start ─────────────────────────────────────────────────────────────────
+# ── /start ────────────────────────────────────────────────────────────────────
 
 def cmd_start(msg: types.Message):
     uid      = msg.from_user.id
     username = msg.from_user.username
 
-    # Parse referral code from /start payload
     parts   = msg.text.strip().split(maxsplit=1)
     ref_arg = parts[1].strip() if len(parts) > 1 else None
     ref_code = ref_arg if (ref_arg and ref_arg.startswith("ref_")) else None
@@ -555,7 +525,6 @@ def cmd_start(msg: types.Message):
         return
     touch_user(uid)
 
-    # Muted users can still browse but not send — tell them where they stand.
     if is_muted(uid):
         remaining = mute_remaining_secs(uid)
         bot.reply_to(msg,
@@ -565,21 +534,24 @@ def cmd_start(msg: types.Message):
             parse_mode="Markdown",
         )
 
-    # Grant referral rewards for brand-new users
     if is_new:
         threading.Thread(
             target=_process_referral_reward, args=(uid,), daemon=True
         ).start()
-        # Send cached welcome media (photos/videos) as a separate batch.
         threading.Thread(
             target=_send_welcome_media, args=(uid,), daemon=True
         ).start()
 
     n    = user_count()
+    u    = get_user(uid)
     secs = get_access_seconds(uid) if not is_admin(uid) else -1
+
     if is_admin(uid):
         time_line = "🛡 Admin — unlimited access"
         kb = admin_keyboard(uid)
+    elif u and _row_is_unlimited(u):
+        time_line = "♾️ Unlimited access — no expiry"
+        kb = user_main_keyboard()
     elif secs > 0:
         time_line = f"⏳ Time balance: *{fmt_time(secs)}*\n`{time_bar(secs)}`"
         kb = user_main_keyboard()
@@ -600,7 +572,7 @@ def cmd_start(msg: types.Message):
     )
 
 
-# ── /help ─────────────────────────────────────────────────────────────────
+# ── /help ─────────────────────────────────────────────────────────────────────
 
 def cmd_help(msg: types.Message):
     is_adm = is_admin(msg.from_user.id)
@@ -629,20 +601,19 @@ def _help_text(is_adm: bool) -> str:
             "🛡 *Admin Commands*\n"
             "`/admin` — admin panel\n"
             "`/users` — user list\n"
-            "`/prof name_or_id` · `/prof` (reply) — open a user's profile panel "
-            "(bot display name/ID, not their Telegram @username)\n"
+            "`/prof name_or_id` · `/prof` (reply) — open a user's profile panel\n"
             "`/ban [reason]` — ban (reply to message)\n"
             "`/unban` — unban user\n"
             "`/mute 10min [reason]` — mute with duration\n"
-            "  (or open a user's profile → 🔇 Mute for the unit + stepper picker)\n"
             "`/pin` — pin a message in every chat (reply to it)\n"
             "`/del 5sec` · `/del 2min` — schedule delete\n"
             "`/delete` — delete one message (reply to it); reverses any time it earned\n"
-            "`/broadcast Your text` — announce to every user (even banned/muted/expired)\n"
+            "`/broadcast Your text` — announce to every user\n"
             "`/stats` — network stats\n"
             "`/addadmin` — promote to admin (reply to message)\n"
+            "`/unlimited <user_id>` — grant a user permanent unlimited access\n"
             "\n_🎁 Use the admin panel to gift 24h to all expired users at once._\n"
-            "_A user's profile panel also has ✉️ Direct Message and ⏰ Usage Time pickers._\n"
+            "_A user's profile panel has ✉️ Direct Message, ⏰ Usage Time, and ♾️ Unlimited._\n"
             "_Durations: `s` / `min` / `h` / `d`_"
         )
     return text
@@ -650,20 +621,16 @@ def _help_text(is_adm: bool) -> str:
 
 # ── Low-time proactive notification ──────────────────────────────────────────
 
-_low_time_warned: set = set()   # uids already notified; cleared when they recharge
+_low_time_warned: set = set()
 
 
 def check_low_time_users():
-    """
-    Called from the maintenance loop every 5 min.
-    Proactively notifies users whose remaining time just dropped below LOW_TIME_WARN.
-    """
     from config import LOW_TIME_WARN
     try:
         users = active_users()
         for u in users:
             uid = u["user_id"]
-            if u["role"] >= 1:   # admins have unlimited time
+            if u["role"] >= 1 or _row_is_unlimited(u):
                 _low_time_warned.discard(uid)
                 continue
             secs = _row_access_secs(u)
@@ -680,12 +647,12 @@ def check_low_time_users():
                           reply_markup=user_main_keyboard(),
                           target_uid=uid)
             elif secs >= LOW_TIME_WARN:
-                _low_time_warned.discard(uid)   # recharged — allow future warnings
+                _low_time_warned.discard(uid)
     except Exception as e:
         log.warning("check_low_time_users error: %s", e)
 
 
-# ── /id ───────────────────────────────────────────────────────────────────
+# ── /id ───────────────────────────────────────────────────────────────────────
 
 def cmd_id(msg: types.Message):
     row = get_user(msg.from_user.id)
@@ -694,10 +661,16 @@ def cmd_id(msg: types.Message):
         return
     name = row["display_name"] or row["random_id"]
     secs = get_access_seconds(msg.from_user.id) if row["role"] == 0 else -1
-    time_info = (
-        f"\n⏱ Time: *{fmt_time(secs)}*\n`{time_bar(secs)}`"
-        if secs >= 0 else "\n🛡 Access: Unlimited"
-    )
+
+    if row["role"] >= 1:
+        time_info = "\n🛡 Access: Unlimited (Admin)"
+    elif _row_is_unlimited(row):
+        time_info = "\n♾️ Access: Unlimited (Gifted)"
+    elif secs >= 0:
+        time_info = f"\n⏱ Time: *{fmt_time(secs)}*\n`{time_bar(secs)}`"
+    else:
+        time_info = "\n⏱ Time: Expired"
+
     bot.reply_to(msg,
         f"🆔 ID: `{row['random_id']}`\n"
         f"📛 Name: *{md(name)}*\n"
@@ -706,7 +679,7 @@ def cmd_id(msg: types.Message):
     )
 
 
-# ── /referral ─────────────────────────────────────────────────────────────
+# ── /referral ─────────────────────────────────────────────────────────────────
 
 def cmd_referral(msg: types.Message):
     uid = msg.from_user.id
@@ -735,7 +708,7 @@ def cmd_referral(msg: types.Message):
     bot.reply_to(msg, text, parse_mode="Markdown", reply_markup=referral_keyboard())
 
 
-# ── /leave ─────────────────────────────────────────────────────────────────
+# ── /leave ────────────────────────────────────────────────────────────────────
 
 def cmd_leave(msg: types.Message):
     row = get_user(msg.from_user.id)
@@ -747,7 +720,7 @@ def cmd_leave(msg: types.Message):
     log.info("User %s left", msg.from_user.id)
 
 
-# ── /name ─────────────────────────────────────────────────────────────────
+# ── /name ─────────────────────────────────────────────────────────────────────
 
 def cmd_name(msg: types.Message):
     row = get_user(msg.from_user.id)
@@ -765,7 +738,7 @@ def cmd_name(msg: types.Message):
         bot.reply_to(msg, f"❌ The name '{name}' is already taken.")
 
 
-# ── /admin ─────────────────────────────────────────────────────────────────
+# ── /admin ────────────────────────────────────────────────────────────────────
 
 def cmd_admin(msg: types.Message):
     if not is_admin(msg.from_user.id):
@@ -776,7 +749,7 @@ def cmd_admin(msg: types.Message):
                  reply_markup=admin_keyboard(msg.from_user.id))
 
 
-# ── /users ─────────────────────────────────────────────────────────────────
+# ── /users ────────────────────────────────────────────────────────────────────
 
 def cmd_users(msg: types.Message):
     if not is_admin(msg.from_user.id):
@@ -787,13 +760,13 @@ def cmd_users(msg: types.Message):
         f"👥 *User List*\n"
         f"━━━━━━━━━━━━━━━━━\n"
         f"Total: *{total}* members\n\n"
-        f"🟢 Active  🔴 Banned  💤 Inactive  🛡️ Admin  👑 Main Admin",
+        f"🟢 Active  🔴 Banned  💤 Inactive  🛡️ Admin  👑 Main Admin  ♾️ Unlimited",
         parse_mode="Markdown",
         reply_markup=users_keyboard(0),
     )
 
 
-# ── /ban ──────────────────────────────────────────────────────────────────
+# ── /ban ──────────────────────────────────────────────────────────────────────
 
 def cmd_ban(msg: types.Message):
     if not is_admin(msg.from_user.id):
@@ -808,14 +781,12 @@ def cmd_ban(msg: types.Message):
         if target_uid == MAIN_ADMIN_ID:
             bot.reply_to(msg, "❌ Cannot ban the main admin.")
             return
-        # Parse optional reason
         parts  = msg.text.strip().split(maxsplit=1)
         reason = parts[1].strip() if len(parts) > 1 else None
         ban_user(target_uid)
         u    = get_user(target_uid)
         name = (u["display_name"] or u["random_id"]) if u else str(target_uid)
         bot.reply_to(msg, f"✅ User *{md(name)}* has been banned.", parse_mode="Markdown")
-        # Notify banned user
         threading.Thread(
             target=_notify_banned, args=(target_uid, reason), daemon=True
         ).start()
@@ -829,7 +800,7 @@ def cmd_ban(msg: types.Message):
         )
 
 
-# ── /unban ─────────────────────────────────────────────────────────────────
+# ── /unban ────────────────────────────────────────────────────────────────────
 
 def cmd_unban(msg: types.Message):
     if not is_admin(msg.from_user.id):
@@ -839,7 +810,7 @@ def cmd_unban(msg: types.Message):
                  reply_markup=banned_users_keyboard(0))
 
 
-# ── /mute ─────────────────────────────────────────────────────────────────
+# ── /mute ─────────────────────────────────────────────────────────────────────
 
 def cmd_mute(msg: types.Message):
     if not is_admin(msg.from_user.id):
@@ -864,15 +835,11 @@ def cmd_mute(msg: types.Message):
         bot.reply_to(msg, "❌ Cannot mute the main admin.")
         return
 
-    # Parse: /mute [duration] [optional reason]
     raw = msg.text.strip()
     args_str = raw[len("/mute"):].strip()
-
-    # Try to extract duration from start of args
     duration_secs = None
     reason        = None
     if args_str:
-        # Find first duration token
         import re
         m = re.match(
             r"(\d+(?:\.\d+)?\s*(?:s|sec|secs|second|seconds"
@@ -885,7 +852,6 @@ def cmd_mute(msg: types.Message):
             duration_secs = parse_duration(m.group(1))
             reason        = m.group(2).strip() or None
         else:
-            # No valid duration — show usage
             bot.reply_to(msg,
                 "❌ Invalid duration.\n"
                 "Examples: `/mute 10min`, `/mute 2h`, `/mute 1d`, `/mute 30min Spamming`",
@@ -893,7 +859,7 @@ def cmd_mute(msg: types.Message):
             )
             return
     else:
-        duration_secs = MUTE_SECONDS  # default 5 min
+        duration_secs = MUTE_SECONDS
 
     if not duration_secs or duration_secs <= 0:
         bot.reply_to(msg, "❌ Duration must be greater than 0.")
@@ -907,8 +873,6 @@ def cmd_mute(msg: types.Message):
     if reason:
         reply_text += f"\n📝 Reason: _{md(reason)}_"
     bot.reply_to(msg, reply_text, parse_mode="Markdown")
-
-    # Notify the muted user via PM
     threading.Thread(
         target=_notify_muted, args=(target_uid, duration_secs, reason), daemon=True
     ).start()
@@ -916,7 +880,7 @@ def cmd_mute(msg: types.Message):
              msg.from_user.id, target_uid, duration_secs, reason)
 
 
-# ── /addadmin ─────────────────────────────────────────────────────────────
+# ── /addadmin ─────────────────────────────────────────────────────────────────
 
 def cmd_addadmin(msg: types.Message):
     if not is_main_admin(msg.from_user.id):
@@ -940,7 +904,73 @@ def cmd_addadmin(msg: types.Message):
             "Reply to a relayed message with /addadmin to promote that user to admin.")
 
 
-# ── /del ──────────────────────────────────────────────────────────────────
+# ── /unlimited ────────────────────────────────────────────────────────────────
+
+def cmd_unlimited(msg: types.Message):
+    """
+    /unlimited <user_id>  — admin only.
+    Grants the specified user permanent unlimited access (removes expiry forever).
+    The user_id is the bot-assigned random_id or display name.
+    Example: /unlimited UWRMJAY3
+    """
+    if not is_admin(msg.from_user.id):
+        bot.reply_to(msg, "❌ You don't have admin access.")
+        return
+
+    parts = msg.text.strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(msg,
+            "Usage: `/unlimited <user_id>`\n\n"
+            "The user\\_id is the bot-assigned ID shown in the user's profile "
+            "(e.g. `UWRMJAY3`), not their Telegram username.\n\n"
+            "_Example:_ `/unlimited UWRMJAY3`",
+            parse_mode="Markdown",
+        )
+        return
+
+    target_id_str = parts[1].strip()
+    u = get_user_by_bot_username(target_id_str)
+    if not u:
+        bot.reply_to(msg,
+            f"❌ No user found with ID or name *{md(target_id_str)}*.\n\n"
+            "Make sure you use the bot-assigned ID (shown in profile), not their Telegram @username.",
+            parse_mode="Markdown",
+        )
+        return
+
+    target_uid = u["user_id"]
+    if target_uid == msg.from_user.id and not is_main_admin(msg.from_user.id):
+        bot.reply_to(msg, "❌ You cannot grant unlimited access to yourself.")
+        return
+
+    if _row_is_unlimited(u):
+        name = u["display_name"] or u["random_id"]
+        bot.reply_to(msg,
+            f"ℹ️ *{md(name)}* already has unlimited access.",
+            parse_mode="Markdown",
+        )
+        return
+
+    set_unlimited_access(target_uid)
+    name = u["display_name"] or u["random_id"]
+
+    bot.reply_to(msg,
+        f"♾️ *Unlimited access granted!*\n"
+        f"━━━━━━━━━━━━━━━━━\n\n"
+        f"User *{md(name)}* (`{u['random_id']}`) now has permanent, non-expiring access.\n"
+        f"Their account will never expire.",
+        parse_mode="Markdown",
+    )
+
+    threading.Thread(
+        target=_notify_unlimited, args=(target_uid,), daemon=True
+    ).start()
+
+    log.info("Admin %s granted unlimited access to user %s (%s)",
+             msg.from_user.id, target_uid, u["random_id"])
+
+
+# ── /del ──────────────────────────────────────────────────────────────────────
 
 def cmd_del(msg: types.Message):
     global _del_running
@@ -967,7 +997,7 @@ def cmd_del(msg: types.Message):
             bot.reply_to(msg, "⏳ A deletion is already scheduled. Please wait.")
             return
         _del_running = True
-        _del_cancel_evt.clear()   # reset any previous cancel signal
+        _del_cancel_evt.clear()
 
     started  = False
     mins     = countdown // 60
@@ -1016,7 +1046,7 @@ def cmd_del(msg: types.Message):
                 _del_running = False
 
 
-# ── /cancelDel ────────────────────────────────────────────────────────────
+# ── /cancelDel ────────────────────────────────────────────────────────────────
 
 def cmd_cancel_del(msg: types.Message):
     if not is_admin(msg.from_user.id):
@@ -1026,7 +1056,7 @@ def cmd_cancel_del(msg: types.Message):
         if not _del_running:
             bot.reply_to(msg, "ℹ️ No deletion is currently scheduled.")
             return
-    _del_cancel_evt.set()   # wake the sleeping thread → it will abort
+    _del_cancel_evt.set()
     bot.reply_to(msg, "✅ Deletion cancelled.")
     cancel_notice = "✅ *Deletion cancelled.* Messages are safe."
     for u in active_users():
@@ -1035,7 +1065,7 @@ def cmd_cancel_del(msg: types.Message):
     log.info("Admin %s cancelled pending /del", msg.from_user.id)
 
 
-# ── /pin ──────────────────────────────────────────────────────────────────
+# ── /pin ──────────────────────────────────────────────────────────────────────
 
 def cmd_pin(msg: types.Message):
     if not is_admin(msg.from_user.id):
@@ -1060,10 +1090,6 @@ def cmd_pin(msg: types.Message):
 
     _parallel_dispatch(msgs_, _pin_one)
 
-    # Muted/expired users are excluded from normal relay/broadcast delivery,
-    # so they never got a copy of this message in the first place. When an
-    # admin pins something, deliver it to them too (from the admin's own
-    # copy) and pin it there — same batch_id, so /delete still cleans it up.
     already  = {m["target_uid"] for m in msgs_}
     already.add(msg.from_user.id)
     src_chat = msg.from_user.id
@@ -1094,7 +1120,7 @@ def cmd_pin(msg: types.Message):
               msg.from_user.id, batch_id, len(msgs_), len(delivered))
 
 
-# ── /broadcast ────────────────────────────────────────────────────────────
+# ── /broadcast ────────────────────────────────────────────────────────────────
 
 def cmd_broadcast(msg: types.Message):
     if not is_admin(msg.from_user.id):
@@ -1119,9 +1145,6 @@ def _run_broadcast(admin_uid: int, body: str):
     text = broadcast_message_text(body)
 
     def _do():
-        # Broadcasts are staff announcements, not relayed content — every
-        # reachable user gets them regardless of ban/mute/expired status.
-        # Relay/welcome-media eligibility rules don't apply here.
         targets = all_reachable_users()
         batch   = str(uuid.uuid4())
 
@@ -1129,8 +1152,6 @@ def _run_broadcast(admin_uid: int, body: str):
             tid = u["user_id"]
             m = _safe(bot.send_message, tid, text, target_uid=tid)
             if m and hasattr(m, "message_id"):
-                # Log every delivered copy so /pin and /delete (which look
-                # messages up by batch) also work on broadcast announcements.
                 log_relay(batch, admin_uid, tid, m.message_id)
 
         _parallel_dispatch(targets, _send_one)
@@ -1142,7 +1163,7 @@ def _run_broadcast(admin_uid: int, body: str):
     threading.Thread(target=_do, daemon=True).start()
 
 
-# ── /delete ───────────────────────────────────────────────────────────────
+# ── /delete ───────────────────────────────────────────────────────────────────
 
 def cmd_delete(msg: types.Message):
     if not is_admin(msg.from_user.id):
@@ -1163,8 +1184,6 @@ def cmd_delete(msg: types.Message):
         time.sleep(0.02)
     delete_relay_log_batch(batch_id)
 
-    # If this media earned its sender a time reward, reverse it now and say
-    # exactly what was deleted and how much was deducted.
     reward = get_media_reward(batch_id)
     delete_media_reward(batch_id)
 
@@ -1197,16 +1216,9 @@ def cmd_delete(msg: types.Message):
               msg.from_user.id, batch_id, len(msgs_), dict(reward) if reward else None)
 
 
-# ── /prof ─────────────────────────────────────────────────────────────────
+# ── /prof ─────────────────────────────────────────────────────────────────────
 
 def cmd_prof(msg: types.Message):
-    """
-    Open a user's admin profile panel two ways besides the Users list:
-      /prof username   — look up by the user's bot-assigned identity
-                         (their display name, or their bot ID if they never
-                         set one) — NOT their Telegram @username.
-      (reply) /prof     — look up the sender of the relayed message replied to
-    """
     if not is_admin(msg.from_user.id):
         bot.reply_to(msg, "❌ You don't have admin access.")
         return
@@ -1220,8 +1232,7 @@ def cmd_prof(msg: types.Message):
         if not uname:
             bot.reply_to(msg,
                 "Usage:\n"
-                "`/prof username` — view a profile by the user's bot name/ID "
-                "(not their Telegram @username)\n"
+                "`/prof username` — view a profile by the user's bot name/ID\n"
                 "Or reply to a relayed message with `/prof`.",
                 parse_mode="Markdown",
             )
@@ -1240,8 +1251,7 @@ def cmd_prof(msg: types.Message):
     else:
         bot.reply_to(msg,
             "Usage:\n"
-            "`/prof username` — view a profile by the user's bot name/ID "
-            "(not their Telegram @username)\n"
+            "`/prof username` — view a profile by the user's bot name/ID\n"
             "Or reply to a relayed message with `/prof`.",
             parse_mode="Markdown",
         )
@@ -1257,7 +1267,7 @@ def cmd_prof(msg: types.Message):
                  parse_mode="Markdown", reply_markup=user_action_keyboard(target_uid))
 
 
-# ── /stats ─────────────────────────────────────────────────────────────────
+# ── /stats ────────────────────────────────────────────────────────────────────
 
 def cmd_stats(msg: types.Message):
     if not is_admin(msg.from_user.id):
@@ -1265,20 +1275,15 @@ def cmd_stats(msg: types.Message):
     bot.reply_to(msg, admin_panel_text(stats()), parse_mode="Markdown")
 
 
-# ── Unknown command ────────────────────────────────────────────────────────
+# ── Unknown command ───────────────────────────────────────────────────────────
 
 def cmd_unknown(msg: types.Message):
     bot.reply_to(msg, "❓ Unknown command. Use /help for the list of commands.")
 
 
-# ── Gift 24h to expired users (admin action) ─────────────────────────────────
+# ── Gift 24h to expired users ─────────────────────────────────────────────────
 
 def _run_gift_24h(admin_uid: int, expired_rows: list):
-    """
-    Gift 24 hours of access to all provided expired users, notify each one
-    individually, then send them 5 random (non-duplicate) welcome media items.
-    Runs in a background thread to avoid blocking the callback.
-    """
     GIFT_SECS = 24 * 3600
     gifted    = 0
     failed    = 0
@@ -1287,7 +1292,6 @@ def _run_gift_24h(admin_uid: int, expired_rows: list):
         tid = u["user_id"]
         try:
             add_access_time(tid, GIFT_SECS)
-            # Notification message to the user
             _safe(bot.send_message, tid,
                   "🎁 *You received a gift from the admins!*\n"
                   "━━━━━━━━━━━━━━━━━\n\n"
@@ -1295,7 +1299,6 @@ def _run_gift_24h(admin_uid: int, expired_rows: list):
                   "The admin team is giving everyone a fresh start.\n"
                   "Enjoy NightVi and keep sharing! 🌙",
                   parse_mode="Markdown", target_uid=tid)
-            # Send 5 random non-duplicate welcome media clips
             _greet_executor.submit(
                 _send_welcome_media,
                 tid,
@@ -1306,7 +1309,6 @@ def _run_gift_24h(admin_uid: int, expired_rows: list):
             log.warning("gift24h failed for uid=%s: %s", tid, e)
             failed += 1
 
-    # Report back to the admin who triggered it
     _safe(bot.send_message, admin_uid,
           f"🎁 *Gift 24h — Complete*\n"
           f"━━━━━━━━━━━━━━━━━\n\n"
@@ -1317,7 +1319,7 @@ def _run_gift_24h(admin_uid: int, expired_rows: list):
     log.info("Admin %s gifted 24h to %d expired users (%d failed)", admin_uid, gifted, failed)
 
 
-# ── Callback handler ───────────────────────────────────────────────────────
+# ── Callback handler ──────────────────────────────────────────────────────────
 
 def on_callback(call: types.CallbackQuery):
     uid  = call.from_user.id
@@ -1327,11 +1329,21 @@ def on_callback(call: types.CallbackQuery):
         bot.answer_callback_query(call.id)
         return
 
-    # ── Time balance ────────────────────────────────────────────────────────
+    # ── Time balance ─────────────────────────────────────────────────────────
     if data in ("time:check", "time:refresh"):
+        u = get_user(uid)
         if is_admin(uid):
             text  = "🛡 *Unlimited Access*\nYou are an admin — no time restrictions."
             kb    = None
+        elif u and _row_is_unlimited(u):
+            text = (
+                "♾️ *Unlimited Access*\n"
+                "━━━━━━━━━━━━━━━━━\n\n"
+                "You have been granted *permanent, non-expiring* access.\n"
+                "Your account will never run out of time. 🎉"
+            )
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("🔙 Back to Menu", callback_data="user:menu"))
         else:
             secs = get_access_seconds(uid)
             if secs > 0:
@@ -1372,7 +1384,7 @@ def on_callback(call: types.CallbackQuery):
         )
         return
 
-    # ── Referral ────────────────────────────────────────────────────────────
+    # ── Referral ─────────────────────────────────────────────────────────────
     if data in ("ref:link", "ref:stats"):
         row = get_user(uid)
         if not row:
@@ -1399,7 +1411,6 @@ def on_callback(call: types.CallbackQuery):
         bot.answer_callback_query(call.id)
         return
 
-    # ── Referral — Copy Link ────────────────────────────────────────────────
     if data == "ref:copy":
         row = get_user(uid)
         if not row:
@@ -1407,21 +1418,17 @@ def on_callback(call: types.CallbackQuery):
         code = get_referral_code(uid)
         me   = bot.get_me()
         link = f"https://t.me/{me.username}?start={code}"
-        # Show link in popup alert so user can long-press & copy on any platform,
-        # and also send it as a code-formatted message for tap-to-copy on mobile.
         bot.answer_callback_query(
             call.id,
             f"✅ Your referral link:\n{link}\n\nLong-press the link above to copy it!",
             show_alert=True,
         )
-        # Also send a standalone message so the link appears in chat as a
-        # code block — on Telegram mobile, tapping a code block copies it.
         _safe(bot.send_message, uid,
               f"📋 *Your Referral Link — tap to copy:*\n\n`{link}`",
               parse_mode="Markdown", target_uid=uid)
         return
 
-    # ── Admin back / refresh ────────────────────────────────────────────────
+    # ── Admin back / refresh ─────────────────────────────────────────────────
     if data == "admin:back":
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Access denied"); return
@@ -1452,7 +1459,7 @@ def on_callback(call: types.CallbackQuery):
         bot.answer_callback_query(call.id)
         return
 
-    # ── Admin: backups ──────────────────────────────────────────────────────
+    # ── Admin: backups ────────────────────────────────────────────────────────
     if data == "admin:backups":
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Access denied"); return
@@ -1470,7 +1477,7 @@ def on_callback(call: types.CallbackQuery):
         bot.answer_callback_query(call.id)
         return
 
-    # ── Users list ──────────────────────────────────────────────────────────
+    # ── Users list ────────────────────────────────────────────────────────────
     if data.startswith("admin:users:"):
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Access denied"); return
@@ -1490,7 +1497,7 @@ def on_callback(call: types.CallbackQuery):
         bot.answer_callback_query(call.id)
         return
 
-    # ── User info ───────────────────────────────────────────────────────────
+    # ── User info ─────────────────────────────────────────────────────────────
     if data.startswith("admin:userinfo:"):
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Access denied"); return
@@ -1514,7 +1521,7 @@ def on_callback(call: types.CallbackQuery):
         bot.answer_callback_query(call.id)
         return
 
-    # ── Ban ─────────────────────────────────────────────────────────────────
+    # ── Ban ───────────────────────────────────────────────────────────────────
     if data.startswith("admin:ban:"):
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Access denied"); return
@@ -1541,7 +1548,7 @@ def on_callback(call: types.CallbackQuery):
             pass
         return
 
-    # ── Unban ───────────────────────────────────────────────────────────────
+    # ── Unban ─────────────────────────────────────────────────────────────────
     if data.startswith("admin:unban:"):
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Access denied"); return
@@ -1566,7 +1573,38 @@ def on_callback(call: types.CallbackQuery):
             pass
         return
 
-    # ── Mute — open the nested unit + stepper builder ───────────────────────
+    # ── Grant Unlimited Access (from user profile panel) ─────────────────────
+    if data.startswith("admin:unlimited:"):
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Access denied"); return
+        try:
+            target = int(data.split(":")[-1])
+        except ValueError:
+            bot.answer_callback_query(call.id); return
+        u = get_user(target)
+        if not u:
+            bot.answer_callback_query(call.id, "User not found"); return
+        if _row_is_unlimited(u):
+            bot.answer_callback_query(call.id, "User already has unlimited access", show_alert=True)
+            return
+        set_unlimited_access(target)
+        name = u["display_name"] or u["random_id"]
+        bot.answer_callback_query(call.id, f"♾️ Unlimited access granted to {name}")
+        threading.Thread(target=_notify_unlimited, args=(target,), daemon=True).start()
+        ref_count   = get_referral_count(target)
+        media_count = get_user_media_count(target)
+        try:
+            bot.edit_message_text(
+                user_info_text(get_user(target), ref_count, media_count),
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown", reply_markup=user_action_keyboard(target),
+            )
+        except Exception:
+            pass
+        log.info("Admin %s granted unlimited access to user %s via panel", uid, target)
+        return
+
+    # ── Mute — open the nested unit + stepper builder ─────────────────────────
     if data.startswith("admin:mute:") and not data.startswith("admin:mutefor:"):
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Access denied"); return
@@ -1588,7 +1626,7 @@ def on_callback(call: types.CallbackQuery):
         bot.answer_callback_query(call.id)
         return
 
-    # ── Mute builder — unit cycle / stepper / confirm / back ────────────────
+    # ── Mute builder — unit cycle / stepper / confirm / back ─────────────────
     if data.startswith("admin:mu:"):
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Access denied"); return
@@ -1658,7 +1696,7 @@ def on_callback(call: types.CallbackQuery):
         bot.answer_callback_query(call.id)
         return
 
-    # ── Unmute ──────────────────────────────────────────────────────────────
+    # ── Unmute ────────────────────────────────────────────────────────────────
     if data.startswith("admin:unmute:"):
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Access denied"); return
@@ -1683,7 +1721,7 @@ def on_callback(call: types.CallbackQuery):
             pass
         return
 
-    # ── Usage Time — open the nested direction + unit + stepper builder ────
+    # ── Usage Time — open the nested direction + unit + stepper builder ───────
     if data.startswith("admin:usagetime:"):
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Access denied"); return
@@ -1707,7 +1745,7 @@ def on_callback(call: types.CallbackQuery):
         bot.answer_callback_query(call.id)
         return
 
-    # ── Usage Time builder — direction / unit / stepper / confirm / back ───
+    # ── Usage Time builder ────────────────────────────────────────────────────
     if data.startswith("admin:ut:"):
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Access denied"); return
@@ -1785,7 +1823,7 @@ def on_callback(call: types.CallbackQuery):
         bot.answer_callback_query(call.id)
         return
 
-    # ── Direct Message — compose ────────────────────────────────────────────
+    # ── Direct Message — compose ──────────────────────────────────────────────
     if data.startswith("admin:dm:"):
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Access denied"); return
@@ -1810,7 +1848,7 @@ def on_callback(call: types.CallbackQuery):
         )
         return
 
-    # ── Direct Message — send confirmed preview ─────────────────────────────
+    # ── Direct Message — send confirmed preview ───────────────────────────────
     if data.startswith("admin:dmsend:"):
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Access denied"); return
@@ -1839,7 +1877,7 @@ def on_callback(call: types.CallbackQuery):
         log.info("Admin %s sent a direct message to %s", uid, target)
         return
 
-    # ── Direct Message — cancel preview ─────────────────────────────────────
+    # ── Direct Message — cancel preview ──────────────────────────────────────
     if data.startswith("admin:dmcancel:"):
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Access denied"); return
@@ -1856,7 +1894,102 @@ def on_callback(call: types.CallbackQuery):
             pass
         return
 
-    # ── Banned list ─────────────────────────────────────────────────────────
+    # ── Admin: Mark feedback as Read ─────────────────────────────────────────
+    if data.startswith("admin:read:"):
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Access denied"); return
+        try:
+            sender_uid = int(data.split(":")[-1])
+        except ValueError:
+            bot.answer_callback_query(call.id); return
+        bot.answer_callback_query(call.id, "✅ Marked as read")
+        # Update the keyboard on the admin's message to show it's been read
+        try:
+            bot.edit_message_reply_markup(
+                call.message.chat.id, call.message.message_id,
+                reply_markup=admin_feedback_read_keyboard(sender_uid),
+            )
+        except Exception:
+            pass
+        # Notify the original sender
+        threading.Thread(
+            target=_notify_admin_read, args=(sender_uid,), daemon=True
+        ).start()
+        log.info("Admin %s marked feedback from user %s as read", uid, sender_uid)
+        return
+
+    # ── Admin: Reply to user feedback ─────────────────────────────────────────
+    if data.startswith("admin:replyto:"):
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Access denied"); return
+        try:
+            sender_uid = int(data.split(":")[-1])
+        except ValueError:
+            bot.answer_callback_query(call.id); return
+        t = get_user(sender_uid)
+        if not t:
+            bot.answer_callback_query(call.id, "User not found", show_alert=True); return
+        name = t["display_name"] or t["random_id"]
+        with _awaiting_lock:
+            _awaiting[uid] = {"action": "feedback_reply", "target": sender_uid}
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            uid,
+            f"💬 *Reply to User*\n"
+            f"━━━━━━━━━━━━━━━━━\n\n"
+            f"Type your reply to *{md(name)}*.\n"
+            f"Your reply will be delivered directly to them — they will see it as an admin reply.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # ── Admin: Send confirmed reply to user ───────────────────────────────────
+    if data.startswith("admin:replysend:"):
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Access denied"); return
+        try:
+            target = int(data.split(":")[-1])
+        except ValueError:
+            bot.answer_callback_query(call.id); return
+        with _reply_pending_lock:
+            pending = _reply_pending.pop(uid, None)
+        if not pending or pending.get("target") != target:
+            bot.answer_callback_query(call.id, "This reply preview has expired.", show_alert=True)
+            return
+        reply_text = pending["text"]
+        threading.Thread(target=_notify_admin_reply, args=(target, reply_text), daemon=True).start()
+        t    = get_user(target)
+        name = (t["display_name"] or t["random_id"]) if t else str(target)
+        bot.answer_callback_query(call.id, f"✅ Reply sent to {name}")
+        try:
+            bot.edit_message_text(
+                f"✅ *Reply sent to {md(name)}.*",
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        log.info("Admin %s replied to feedback from user %s", uid, target)
+        return
+
+    # ── Admin: Cancel reply ────────────────────────────────────────────────────
+    if data.startswith("admin:replycancel:"):
+        if not is_admin(uid):
+            bot.answer_callback_query(call.id, "Access denied"); return
+        with _reply_pending_lock:
+            _reply_pending.pop(uid, None)
+        bot.answer_callback_query(call.id, "Cancelled")
+        try:
+            bot.edit_message_text(
+                "❌ *Reply cancelled.*",
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Banned list ───────────────────────────────────────────────────────────
     if data == "admin:banned":
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Access denied"); return
@@ -1889,7 +2022,7 @@ def on_callback(call: types.CallbackQuery):
         bot.answer_callback_query(call.id)
         return
 
-    # ── Muted list ──────────────────────────────────────────────────────────
+    # ── Muted list ────────────────────────────────────────────────────────────
     if data == "admin:muted":
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Access denied"); return
@@ -1917,7 +2050,7 @@ def on_callback(call: types.CallbackQuery):
         bot.answer_callback_query(call.id)
         return
 
-    # ── Gift 24h to all expired users ────────────────────────────────────────
+    # ── Gift 24h to all expired users ─────────────────────────────────────────
     if data == "admin:gift24h":
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Access denied"); return
@@ -1973,7 +2106,7 @@ def on_callback(call: types.CallbackQuery):
         log.info("Admin %s triggered gift24h for %d expired users", uid, count)
         return
 
-    # ── Welcome media collection ──────────────────────────────────────────────
+    # ── Welcome media collection ───────────────────────────────────────────────
     if data == "welcome:start":
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Admins only"); return
@@ -1981,9 +2114,6 @@ def on_callback(call: types.CallbackQuery):
             _collecting_welcome.add(uid)
         bot.answer_callback_query(call.id)
         current = count_welcome_media()
-        # Clear any leftover reply keyboard from an older version of this flow
-        # (this is what caused the "✅ Done" button to look permanently stuck
-        # for some admins) before showing the new inline "Done" button.
         _safe(bot.send_message, uid, "⏳ Preparing upload session…",
               reply_markup=remove_keyboard(), target_uid=uid)
         bot.send_message(
@@ -2001,7 +2131,6 @@ def on_callback(call: types.CallbackQuery):
         )
         return
 
-    # ── Welcome media collection — finish (inline "✅ Done" button) ───────────
     if data == "welcome:done":
         if not is_admin(uid):
             bot.answer_callback_query(call.id, "Admins only"); return
@@ -2043,7 +2172,7 @@ def on_callback(call: types.CallbackQuery):
         )
         return
 
-    # ── Add admin ───────────────────────────────────────────────────────────
+    # ── Add admin ─────────────────────────────────────────────────────────────
     if data == "admin:addadmin":
         if not is_main_admin(uid):
             bot.answer_callback_query(call.id, "Main admin only"); return
@@ -2054,7 +2183,7 @@ def on_callback(call: types.CallbackQuery):
         )
         return
 
-    # ── Media settings ──────────────────────────────────────────────────────
+    # ── Media settings ────────────────────────────────────────────────────────
     if data == "media:show":
         if not is_main_admin(uid):
             bot.answer_callback_query(call.id, "Main admin only"); return
@@ -2101,7 +2230,7 @@ def on_callback(call: types.CallbackQuery):
         )
         return
 
-    # ── User main menu ───────────────────────────────────────────────────────
+    # ── User main menu ────────────────────────────────────────────────────────
     if data == "user:menu":
         row = get_user(uid)
         if not row:
@@ -2111,6 +2240,9 @@ def on_callback(call: types.CallbackQuery):
         if is_admin(uid):
             time_line = "🛡 Admin — unlimited access"
             kb        = admin_keyboard(uid)
+        elif _row_is_unlimited(row):
+            time_line = "♾️ Unlimited access — no expiry"
+            kb        = user_main_keyboard()
         elif secs > 0:
             time_line = f"⏳ Time balance: *{fmt_time(secs)}*\n`{time_bar(secs)}`"
             kb        = user_main_keyboard()
@@ -2134,7 +2266,7 @@ def on_callback(call: types.CallbackQuery):
         bot.answer_callback_query(call.id)
         return
 
-    # ── Profile view ─────────────────────────────────────────────────────────
+    # ── Profile view ──────────────────────────────────────────────────────────
     if data == "profile:show":
         row = get_user(uid)
         if not row:
@@ -2142,10 +2274,14 @@ def on_callback(call: types.CallbackQuery):
         name = row["display_name"] or row["random_id"]
         secs = get_access_seconds(uid) if row["role"] == 0 else -1
         ref_count = get_referral_count(uid)
-        if secs >= 0:
+        if row["role"] >= 1:
+            time_line = "🛡 Unlimited (Admin)"
+        elif _row_is_unlimited(row):
+            time_line = "♾️ Unlimited (Gifted by Admin)"
+        elif secs >= 0:
             time_line = f"⏱ *{fmt_time(secs)}* remaining\n`{time_bar(secs)}`"
         else:
-            time_line = "🛡 Unlimited (Admin)"
+            time_line = "⌛ Expired"
         text = (
             f"👤 *Profile*\n"
             f"━━━━━━━━━━━━━━━━━\n\n"
@@ -2176,7 +2312,7 @@ def on_callback(call: types.CallbackQuery):
         )
         return
 
-    # ── Leave network (with confirmation) ────────────────────────────────────
+    # ── Leave network (with confirmation) ─────────────────────────────────────
     if data == "user:leave":
         row = get_user(uid)
         if not row or not row["active"]:
@@ -2211,25 +2347,91 @@ def on_callback(call: types.CallbackQuery):
         log.info("User %s left via button", uid)
         return
 
-    # ── Feedback / Contact Admin ─────────────────────────────────────────────
-    if data == "user:feedback":
+    # ── Feedback — user confirms sending to admins ────────────────────────────
+    if data == "feedback:send":
         row = get_user(uid)
         if not row:
             bot.answer_callback_query(call.id, "Please /start first."); return
-        with _awaiting_lock:
-            _awaiting[uid] = {"action": "feedback_compose"}
-        bot.answer_callback_query(call.id)
-        bot.send_message(
-uid,
-            "💬 *Contact Admin*\n"
+        with _feedback_pending_lock:
+            pending = _feedback_pending.pop(uid, None)
+        if not pending:
+            bot.answer_callback_query(call.id, "This message has expired. Please try again.", show_alert=True)
+            return
+        text_body = pending["text"]
+
+        # Build the admin notification message
+        name_display = row["display_name"] or row["random_id"]
+        uname_tg     = f"@{row['username']}" if row["username"] else "—"
+        if row["role"] >= 2:
+            role_str = "👑 Main Admin"
+        elif row["role"] >= 1:
+            role_str = "🛡️ Admin"
+        elif _row_is_unlimited(row):
+            role_str = "♾️ User (Unlimited)"
+        else:
+            role_str = "👤 User"
+        secs     = _row_access_secs(row)
+        time_str = fmt_time(secs) if secs > 0 else "Expired"
+
+        admin_msg = (
+            "📩 *User Message*\n"
             "━━━━━━━━━━━━━━━━━\n\n"
-            "Type your message below — it will be sent directly to all admins.\n\n"
-            "_Write anything: feedback, questions, or reports._",
-            parse_mode="Markdown",
+            f"👤 *From:* {md(name_display)}\n"
+            f"🆔 *Bot ID:* `{row['random_id']}`\n"
+            f"📱 *Telegram:* {md(uname_tg)}\n"
+            f"🎭 *Role:* {role_str}\n"
+            f"⏱ *Balance:* {time_str}\n"
+            f"━━━━━━━━━━━━━━━━━\n\n"
+            f"💬 *Message:*\n{md(text_body)}"
         )
+
+        # Deliver to every admin with Read + Reply buttons
+        admin_ids  = get_all_admin_ids()
+        sent_count = 0
+        for aid in admin_ids:
+            result = _safe(
+                bot.send_message, aid, admin_msg,
+                parse_mode="Markdown",
+                reply_markup=admin_feedback_keyboard(uid),
+                target_uid=aid,
+            )
+            if result:
+                sent_count += 1
+
+        # Confirm to user and update message
+        try:
+            bot.edit_message_text(
+                "✅ *Message sent to the admin team!*\n\n"
+                "An admin will review your message and may respond via direct reply.\n"
+                "Thank you for reaching out! 💙",
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id, "✅ Message sent!")
+        log.info("User %s sent feedback to %d admin(s)", uid, sent_count)
         return
 
-    # ── Help (inline) ────────────────────────────────────────────────────────
+    # ── Feedback — user cancels ────────────────────────────────────────────────
+    if data == "feedback:cancel":
+        with _feedback_pending_lock:
+            _feedback_pending.pop(uid, None)
+        bot.answer_callback_query(call.id, "Cancelled")
+        try:
+            bot.edit_message_text(
+                "❌ *Message cancelled.*\n\nReturn to the menu whenever you need help.",
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown",
+                reply_markup=types.InlineKeyboardMarkup().add(
+                    types.InlineKeyboardButton("🔙 Back to Menu", callback_data="user:menu")
+                ),
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Help (inline) ─────────────────────────────────────────────────────────
     if data == "user:help":
         back_kb = types.InlineKeyboardMarkup()
         back_kb.add(types.InlineKeyboardButton("🔙   Back to Menu", callback_data="user:menu"))
@@ -2245,10 +2447,28 @@ uid,
         bot.answer_callback_query(call.id)
         return
 
+    # ── Feedback (Contact Admin) ───────────────────────────────────────────────
+    if data == "user:feedback":
+        row = get_user(uid)
+        if not row:
+            bot.answer_callback_query(call.id, "Please /start first."); return
+        with _awaiting_lock:
+            _awaiting[uid] = {"action": "feedback_compose"}
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            uid,
+            "💬 *Contact Admin*\n"
+            "━━━━━━━━━━━━━━━━━\n\n"
+            "Type your message below — it will be sent directly to all admins.\n\n"
+            "_Write anything: feedback, questions, or reports._",
+            parse_mode="Markdown",
+        )
+        return
+
     bot.answer_callback_query(call.id)
 
 
-# ── Main message handler ───────────────────────────────────────────────────
+# ── Main message handler ──────────────────────────────────────────────────────
 
 def handle_message(msg: types.Message):
     uid = msg.from_user.id if msg.from_user else None
@@ -2259,18 +2479,11 @@ def handle_message(msg: types.Message):
 
     row = get_user(uid)
 
-    # ── Welcome media collection mode (admin-only, separate from relay) ──────
+    # ── Welcome media collection mode ─────────────────────────────────────────
     with _collecting_welcome_lock:
         collecting = uid in _collecting_welcome
     if collecting:
         if not is_admin(uid):
-            # Safety net: admin role revoked mid-session. This branch used to
-            # fall through to the relay/broadcast path below after discarding
-            # the user from collection mode — that's exactly why the welcome
-            # media (and any leftover "✅ Done" button press) could end up
-            # relayed to every user in the network. We now always stop here
-            # instead of letting anything from a collection-mode session leak
-            # into the normal message flow.
             with _collecting_welcome_lock:
                 _collecting_welcome.discard(uid)
             bot.reply_to(msg,
@@ -2279,10 +2492,6 @@ def handle_message(msg: types.Message):
             )
             return
         elif msg.text and msg.text.strip() == "✅ Done":
-            # Legacy fallback only: older clients may still have the retired
-            # reply-keyboard "✅ Done" button stuck on screen. Honor it once,
-            # finish the same way the new inline "Done ✅" button does, and
-            # explicitly clear the stuck reply keyboard so it stops appearing.
             with _collecting_welcome_lock:
                 _collecting_welcome.discard(uid)
             total = count_welcome_media()
@@ -2320,7 +2529,7 @@ def handle_message(msg: types.Message):
                 )
             return
 
-    # ── Awaiting input (admin video size setting, broadcast, feedback, etc.) ──
+    # ── Awaiting input ────────────────────────────────────────────────────────
     with _awaiting_lock:
         aw = _awaiting.pop(uid, None) if msg.text else None
     if aw is not None:
@@ -2371,55 +2580,47 @@ def handle_message(msg: types.Message):
                 )
 
         elif aw["action"] == "feedback_compose":
-            # User sending feedback/message to all admins
+            # User typed their feedback — show confirmation before sending
             text_body = (msg.text or "").strip()
             if not text_body:
                 bot.reply_to(msg, "❌ Message cannot be empty. Please type your message.")
                 with _awaiting_lock:
                     _awaiting[uid] = aw
             else:
-                # Build the user info block for admins
-                u = get_user(uid)
-                name_display = (u["display_name"] or u["random_id"]) if u else str(uid)
-                uname_tg     = f"@{u['username']}" if (u and u["username"]) else "—"
-                role_str     = (
-                    "👑 Main Admin" if (u and u["role"] >= 2)
-                    else "🛡️ Admin"   if (u and u["role"] >= 1)
-                    else "👤 User"
-                )
-                secs = _row_access_secs(u) if u else 0
-                time_str = fmt_time(secs) if secs > 0 else "Expired"
-
-                admin_msg = (
-                    "📩 *Feedback / User Message*\n"
-                    "━━━━━━━━━━━━━━━━━\n\n"
-                    f"👤 *From:* {md(name_display)}\n"
-                    f"🆔 *Bot ID:* `{u['random_id'] if u else uid}`\n"
-                    f"📱 *Telegram:* {md(uname_tg)}\n"
-                    f"🎭 *Role:* {role_str}\n"
-                    f"⏱ *Balance:* {time_str}\n"
-                    f"━━━━━━━━━━━━━━━━━\n\n"
-                    f"💬 *Message:*\n{md(text_body)}"
-                )
-
-                # Deliver to every admin
-                admin_ids = get_all_admin_ids()
-                sent_count = 0
-                for aid in admin_ids:
-                    result = _safe(bot.send_message, aid, admin_msg,
-                                   parse_mode="Markdown", target_uid=aid)
-                    if result:
-                        sent_count += 1
-
-                # Confirm to user
+                # Store in pending and show preview for confirmation
+                with _feedback_pending_lock:
+                    _feedback_pending[uid] = {"text": text_body}
                 bot.reply_to(msg,
-                    "✅ *Message sent to the admin team!*\n\n"
-                    "An admin will review your message and may respond to you via Direct Message.\n"
-                    "Thank you for your feedback! 💙",
+                    f"💬 *Confirm Your Message*\n"
+                    f"━━━━━━━━━━━━━━━━━\n\n"
+                    f"{md(text_body)}\n\n"
+                    f"━━━━━━━━━━━━━━━━━\n"
+                    f"Send this message to the admin team?",
                     parse_mode="Markdown",
-                    reply_markup=user_main_keyboard(),
+                    reply_markup=feedback_confirm_keyboard(),
                 )
-                log.info("User %s sent feedback to %d admin(s)", uid, sent_count)
+
+        elif aw["action"] == "feedback_reply":
+            # Admin typed a reply to a user's feedback
+            target    = aw.get("target")
+            text_body = (msg.text or "").strip()
+            if not text_body:
+                bot.reply_to(msg, "❌ Reply cannot be empty. Try again.")
+                with _awaiting_lock:
+                    _awaiting[uid] = aw
+            else:
+                with _reply_pending_lock:
+                    _reply_pending[uid] = {"target": target, "text": text_body}
+                t        = get_user(target)
+                tgt_name = (t["display_name"] or t["random_id"]) if t else str(target)
+                bot.reply_to(msg,
+                    f"💬 *Preview — Reply to {md(tgt_name)}*\n"
+                    f"━━━━━━━━━━━━━━━━━\n\n"
+                    f"{md(text_body)}\n\n"
+                    f"Send this reply?",
+                    parse_mode="Markdown",
+                    reply_markup=admin_reply_confirm_keyboard(target),
+                )
 
         else:
             try:
@@ -2458,7 +2659,7 @@ def handle_message(msg: types.Message):
 
     touch_user(uid)
 
-    # ── Duplicate media check ────────────────────────────────────────────────
+    # ── Duplicate media check ─────────────────────────────────────────────────
     has_media = (msg.photo or msg.video or msg.document or msg.audio
                  or msg.voice or msg.animation or msg.sticker or msg.video_note)
     if has_media and is_duplicate_media(msg):
@@ -2470,14 +2671,10 @@ def handle_message(msg: types.Message):
         )
         return
 
-    # This batch_id is generated up front (rather than inside relay_message)
-    # so the media_rewards row recorded below and the relay_log rows written
-    # during relay share the same id — that's how /delete later finds out
-    # exactly how much earned time to reverse for a given piece of media.
     batch_id = str(uuid.uuid4())
 
-    # ── Time-earning from photos ──────────────────────────────────────────────
-    if msg.photo and not is_admin(uid):
+    # ── Time-earning from photos ───────────────────────────────────────────────
+    if msg.photo and not is_admin(uid) and not _row_is_unlimited(row):
         was_expired = add_access_time_returning_was_expired(uid, PHOTO_REWARD_SECS)
         remaining = get_access_seconds(uid)
         if PHOTO_REWARD_SECS > 0:
@@ -2492,16 +2689,12 @@ def handle_message(msg: types.Message):
         if was_expired:
             _greet_returning_user(uid)
 
-    # ── Time-earning from videos ──────────────────────────────────────────────
-    elif msg.video and not is_admin(uid):
+    # ── Time-earning from videos ───────────────────────────────────────────────
+    elif msg.video and not is_admin(uid) and not _row_is_unlimited(row):
         size_bytes  = msg.video.file_size or 0
         mb          = size_bytes / BYTES_PER_MIN
         earned_secs = int(mb * VIDEO_REWARD_PER_MB)
 
-        # ── Small-video streak check ────────────────────────────────────────
-        # Warns the user if they send too many small videos (under the
-        # threshold) back-to-back — resets whenever a normal-size video
-        # breaks the streak, and resets again right after warning.
         if mb < SMALL_VIDEO_MB_THRESHOLD:
             with _small_video_streak_lock:
                 streak = _small_video_streak.get(uid, 0) + 1
@@ -2556,7 +2749,7 @@ def handle_message(msg: types.Message):
         return
 
     # ── Low time warning ──────────────────────────────────────────────────────
-    if not is_admin(uid) and not (msg.photo or msg.video):
+    if not is_admin(uid) and not _row_is_unlimited(row) and not (msg.photo or msg.video):
         secs = get_access_seconds(uid)
         if 0 < secs < LOW_TIME_WARN:
             bot.reply_to(msg,
@@ -2574,9 +2767,7 @@ def handle_message(msg: types.Message):
         bot.reply_to(msg, f"❌ {err}")
         return
 
-    # ── Link filtering ──────────────────────────────────────────────────────────
-    # Plain text messages that contain a link are blocked outright — nothing is
-    # relayed, and the sender is told why.
+    # ── Link filtering ────────────────────────────────────────────────────────
     if msg.text and contains_link(msg.text):
         bot.reply_to(msg,
             "🚫 *Links are not allowed.*\n\n"
@@ -2585,21 +2776,15 @@ def handle_message(msg: types.Message):
         )
         return
 
-    # A link inside a photo/video caption isn't blocked outright — the caption
-    # is relayed with the link stripped out (see strip_links() in _relay_to).
-    # We just need to remember it happened so we can tell the sender below.
     caption_link_removed = bool(
         msg.caption and (msg.photo or msg.video) and contains_link(msg.caption)
     )
 
-    # ── Automatic media backup (non-blocking) ─────────────────────────────────
+    # ── Automatic media backup ─────────────────────────────────────────────────
     if has_media:
         backup_message_media(bot, msg, uid)
 
     # ── Relay ─────────────────────────────────────────────────────────────────
-    # Filter once, up front, so the confirmation count below always matches
-    # exactly who receives the message — banned/muted/expired users are
-    # excluded here and never even handed to relay_message.
     targets      = [t for t in active_users(exclude_id=uid) if _is_eligible_recipient(t)]
     target_count = len(targets)
     threading.Thread(
@@ -2615,13 +2800,12 @@ def handle_message(msg: types.Message):
               "photo/video was relayed to the network.",
               parse_mode="Markdown", target_uid=uid)
 
-    # Confirmation for admins (regular users already see time-earn replies)
     if is_admin(uid):
         _safe(bot.reply_to, msg, f"✓ Relayed to *{target_count}* member(s).",
               parse_mode="Markdown", target_uid=uid)
 
 
-# ── Media policy check ────────────────────────────────────────────────────
+# ── Media policy check ────────────────────────────────────────────────────────
 
 def _check_media_allowed(message, ms):
     if message.text:

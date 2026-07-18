@@ -32,29 +32,30 @@ from handlers import (
     cmd_start, cmd_help, cmd_id, cmd_referral, cmd_leave, cmd_name,
     cmd_admin, cmd_users, cmd_ban, cmd_unban, cmd_mute, cmd_addadmin,
     cmd_del, cmd_cancel_del, cmd_delete, cmd_stats, cmd_unknown,
-    cmd_pin, cmd_broadcast, cmd_prof,
+    cmd_pin, cmd_broadcast, cmd_prof, cmd_unlimited,
     on_callback, handle_message,
     prune_memory_state, check_low_time_users, remind_expired_users, _shutdown,
 )
 
-bot.register_message_handler(cmd_start,    commands=["start"],               pass_bot=False)
-bot.register_message_handler(cmd_help,     commands=["help"],                pass_bot=False)
-bot.register_message_handler(cmd_id,       commands=["id", "status", "me"],  pass_bot=False)
-bot.register_message_handler(cmd_referral, commands=["referral", "ref"],     pass_bot=False)
-bot.register_message_handler(cmd_leave,    commands=["leave"],               pass_bot=False)
-bot.register_message_handler(cmd_name,     commands=["name"],                pass_bot=False)
-bot.register_message_handler(cmd_admin,    commands=["admin"],               pass_bot=False)
-bot.register_message_handler(cmd_users,    commands=["users"],               pass_bot=False)
-bot.register_message_handler(cmd_ban,      commands=["ban"],                 pass_bot=False)
-bot.register_message_handler(cmd_unban,    commands=["unban"],               pass_bot=False)
-bot.register_message_handler(cmd_mute,     commands=["mute"],                pass_bot=False)
-bot.register_message_handler(cmd_addadmin, commands=["addadmin"],            pass_bot=False)
-bot.register_message_handler(cmd_del,      commands=["del"],                 pass_bot=False)
-bot.register_message_handler(cmd_delete,   commands=["delete", "Delete"],    pass_bot=False)
-bot.register_message_handler(cmd_pin,      commands=["pin"],                 pass_bot=False)
-bot.register_message_handler(cmd_broadcast, commands=["broadcast"],          pass_bot=False)
-bot.register_message_handler(cmd_stats,    commands=["stats"],               pass_bot=False)
-bot.register_message_handler(cmd_prof,     commands=["prof"],                pass_bot=False)
+bot.register_message_handler(cmd_start,     commands=["start"],               pass_bot=False)
+bot.register_message_handler(cmd_help,      commands=["help"],                pass_bot=False)
+bot.register_message_handler(cmd_id,        commands=["id", "status", "me"],  pass_bot=False)
+bot.register_message_handler(cmd_referral,  commands=["referral", "ref"],     pass_bot=False)
+bot.register_message_handler(cmd_leave,     commands=["leave"],               pass_bot=False)
+bot.register_message_handler(cmd_name,      commands=["name"],                pass_bot=False)
+bot.register_message_handler(cmd_admin,     commands=["admin"],               pass_bot=False)
+bot.register_message_handler(cmd_users,     commands=["users"],               pass_bot=False)
+bot.register_message_handler(cmd_ban,       commands=["ban"],                 pass_bot=False)
+bot.register_message_handler(cmd_unban,     commands=["unban"],               pass_bot=False)
+bot.register_message_handler(cmd_mute,      commands=["mute"],                pass_bot=False)
+bot.register_message_handler(cmd_addadmin,  commands=["addadmin"],            pass_bot=False)
+bot.register_message_handler(cmd_del,       commands=["del"],                 pass_bot=False)
+bot.register_message_handler(cmd_delete,    commands=["delete", "Delete"],    pass_bot=False)
+bot.register_message_handler(cmd_pin,       commands=["pin"],                 pass_bot=False)
+bot.register_message_handler(cmd_broadcast, commands=["broadcast"],           pass_bot=False)
+bot.register_message_handler(cmd_stats,     commands=["stats"],               pass_bot=False)
+bot.register_message_handler(cmd_prof,      commands=["prof"],                pass_bot=False)
+bot.register_message_handler(cmd_unlimited, commands=["unlimited"],           pass_bot=False)
 bot.register_message_handler(
     cmd_unknown,
     func=lambda m: m.text and m.text.startswith("/"),
@@ -82,7 +83,6 @@ def _maintenance_loop():
                 prune_memory_state()
                 cleanup_old_relay_log()
                 log.info("Maintenance: done")
-            # Every ~6h (72 ticks * 300s = 21600s), nudge expired-time users.
             if tick % 72 == 0:
                 remind_expired_users()
         except Exception as e:
@@ -113,11 +113,8 @@ if __name__ == "__main__":
     bot.delete_webhook(drop_pending_updates=False)
     threading.Thread(target=_maintenance_loop, daemon=True).start()
 
-    # Update announcement + legacy user seeding (runs only once, ever)
     from update_notifier import run_update_notifier, run_deploy_notifier
     run_update_notifier(bot)
-
-    # Notify the main admin every time the bot is redeployed/restarted
     run_deploy_notifier(bot)
 
     log.info("Polling started.")

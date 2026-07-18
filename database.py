@@ -63,17 +63,18 @@ def init_db():
                     access_until   TEXT    DEFAULT NULL
                 )
             """)
-            # Tracks the last time we DM'd a time-expired user a reminder, so
-            # the 6-hourly reminder job never re-sends more often than that.
+            # Tracks the last time we DM'd a time-expired user a reminder.
             cur.execute("""
                 ALTER TABLE users
                 ADD COLUMN IF NOT EXISTS last_expired_reminder TEXT DEFAULT NULL
             """)
+            # Unlimited access flag — set by /unlimited <id> admin command.
+            # Users with this flag never expire regardless of access_until.
+            cur.execute("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS is_unlimited INTEGER DEFAULT 0
+            """)
 
-            # Cheap, indexed eligibility lookups keep the admin panel / relay
-            # confirmation counts and the reminder job fast as the users table
-            # grows — this matters directly for hosting cost, since Postgres
-            # would otherwise scan the whole table on every relayed message.
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_users_active_banned "
                 "ON users(active, is_banned)"
@@ -171,9 +172,6 @@ def init_db():
                 )
             """)
 
-            # Tracks which welcome-media items each user has already received
-            # so consecutive "welcome back" batches never repeat the same clip.
-            # When a user has seen every item the pool resets automatically.
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS user_welcome_media_seen (
                     user_id   BIGINT  NOT NULL,
@@ -187,10 +185,6 @@ def init_db():
                 ON user_welcome_media_seen(user_id)
             """)
 
-            # Links a relay batch (the copies of one piece of media delivered
-            # to every recipient) back to the time reward it earned its
-            # sender. This is what lets /delete tell an admin exactly how
-            # much time to reverse when a media message is removed.
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS media_rewards (
                     batch_id      TEXT    PRIMARY KEY,
@@ -205,7 +199,6 @@ def init_db():
                 "ON media_rewards(sender_uid)"
             )
 
-            # Case-insensitive username lookups power /prof <username>.
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_users_username_lower "
                 "ON users (LOWER(username))"
@@ -290,9 +283,6 @@ def upsert_user(uid, username, referral_code=None):
 
 
 def get_user_by_username(username: str):
-    """Case-insensitive lookup by the user's *Telegram* username. `username`
-    should be passed without a leading '@'. Not used by /prof — see
-    get_user_by_bot_username() for the bot-assigned identity lookup."""
     if not username:
         return None
     with _db_lock:
@@ -309,13 +299,7 @@ def get_user_by_username(username: str):
 
 
 def get_user_by_bot_username(name: str):
-    """Case-insensitive lookup used by /prof <username>.
-
-    `name` refers to the identity the bot itself gave the user — never their
-    Telegram @username. It matches, in order:
-      1. Their bot display name (display_name — set via Profile → Set Name).
-      2. Their bot ID (random_id — the `🆔 ID:` shown on their profile).
-    """
+    """Case-insensitive lookup by the bot-assigned identity (display_name or random_id)."""
     if not name:
         return None
     with _db_lock:
@@ -495,12 +479,7 @@ def active_users(exclude_id=None):
 
 
 def all_reachable_users(exclude_id=None):
-    """
-    Every user we can still physically message — i.e. hasn't blocked/left the
-    bot (active=1). Unlike active_users(), this deliberately includes banned,
-    muted, and access-expired users: broadcasts are announcements from staff
-    and must reach everyone, regardless of their relay/media eligibility.
-    """
+    """Every user we can still physically message (active=1). Includes banned/muted/expired."""
     with _db_lock:
         conn = _conn()
         try:
@@ -558,6 +537,14 @@ def get_all_admin_ids() -> list:
 
 # ── Time-access helpers ───────────────────────────────────────────────────────
 
+def _row_is_unlimited(row) -> bool:
+    """True if this user has been granted permanent unlimited access via /unlimited."""
+    if not row:
+        return False
+    val = row.get("is_unlimited") if isinstance(row, dict) else row["is_unlimited"]
+    return bool(val)
+
+
 def _row_access_secs(row) -> int:
     au = row.get("access_until") if isinstance(row, dict) else row["access_until"]
     if not au:
@@ -603,15 +590,6 @@ def add_access_time(uid, seconds: int):
 
 
 def add_access_time_returning_was_expired(uid, seconds: int) -> bool:
-    """
-    Same effect as add_access_time(uid, seconds), but does the "was this user
-    out of time?" check and the balance update inside one _db_lock-protected
-    transaction, so a "welcome back" greet can be dispatched exactly once per
-    genuine expired→active transition. Calling get_access_seconds(uid) and
-    add_access_time(uid, ...) as two separate locked calls (as the caller
-    used to) leaves a gap between them where a second concurrent message
-    from the same user could also read "expired" and double-fire the greet.
-    """
     with _db_lock:
         conn = _conn()
         try:
@@ -641,13 +619,6 @@ def add_access_time_returning_was_expired(uid, seconds: int) -> bool:
 
 
 def subtract_access_time(uid, seconds: int) -> int:
-    """
-    Subtract `seconds` from a user's access_until timestamp — the inverse of
-    add_access_time(). Used to reverse a time reward (e.g. an admin deletes
-    the media that earned it) or to let an admin manually dock balance.
-    Returns the user's new remaining access seconds (0 if that's now in the
-    past, same convention as get_access_seconds()).
-    """
     with _db_lock:
         conn = _conn()
         try:
@@ -673,12 +644,34 @@ def subtract_access_time(uid, seconds: int) -> int:
             conn.close()
 
 
+def set_unlimited_access(uid):
+    """
+    Grant a user permanent, non-expiring access.
+    Sets is_unlimited=1 and clears access_until.
+    Admin-only feature triggered by /unlimited <random_id>.
+    """
+    with _db_lock:
+        conn = _conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE users SET is_unlimited=1, access_until=NULL WHERE user_id=%s",
+                (uid,)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
 def has_access(uid) -> bool:
-    return is_admin(uid) or get_access_seconds(uid) > 0
+    row = get_user(uid)
+    if not row:
+        return False
+    return row["role"] >= 1 or _row_is_unlimited(row) or get_access_seconds(uid) > 0
 
 
 def _row_has_access(row) -> bool:
-    return row["role"] >= 1 or _row_access_secs(row) > 0
+    return row["role"] >= 1 or _row_is_unlimited(row) or _row_access_secs(row) > 0
 
 
 def user_count():
@@ -710,24 +703,25 @@ def stats():
                 (now,),
             )
             muted = cur.fetchone()["cnt"]
-            # "Eligible" = would actually receive a relayed/broadcast message
-            # right now: active, not banned, not muted, admin or time left.
             cur.execute(
                 "SELECT COUNT(*) as cnt FROM users WHERE active=1 AND is_banned=0 "
                 "AND (muted_until IS NULL OR muted_until <= %s) "
-                "AND (role>=1 OR (access_until IS NOT NULL AND access_until > %s))",
+                "AND (role>=1 OR is_unlimited=1 OR (access_until IS NOT NULL AND access_until > %s))",
                 (now, now),
             )
             eligible_active = cur.fetchone()["cnt"]
-            # Non-admin, in-network, not banned/muted, but out of access time.
             cur.execute(
                 "SELECT COUNT(*) as cnt FROM users WHERE active=1 AND is_banned=0 "
-                "AND role=0 "
+                "AND role=0 AND (is_unlimited IS NULL OR is_unlimited=0) "
                 "AND (muted_until IS NULL OR muted_until <= %s) "
                 "AND (access_until IS NULL OR access_until <= %s)",
                 (now, now),
             )
             expired = cur.fetchone()["cnt"]
+            cur.execute(
+                "SELECT COUNT(*) as cnt FROM users WHERE is_unlimited=1 AND is_banned=0"
+            )
+            unlimited_count = cur.fetchone()["cnt"]
             cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
             cur.execute(
                 "SELECT COUNT(*) as cnt FROM users WHERE last_seen>%s AND is_banned=0",
@@ -743,7 +737,7 @@ def stats():
             return {
                 "total": total, "active": active, "banned": banned,
                 "muted": muted, "eligible_active": eligible_active,
-                "expired": expired,
+                "expired": expired, "unlimited": unlimited_count,
                 "recent_24h": recent, "admins": admins,
                 "backups": backups, "referrals": refs,
             }
@@ -752,7 +746,6 @@ def stats():
 
 
 def get_eligible_active_count() -> int:
-    """Users who would actually receive a relayed/broadcast message right now."""
     with _db_lock:
         conn = _conn()
         try:
@@ -761,7 +754,7 @@ def get_eligible_active_count() -> int:
             cur.execute(
                 "SELECT COUNT(*) as cnt FROM users WHERE active=1 AND is_banned=0 "
                 "AND (muted_until IS NULL OR muted_until <= %s) "
-                "AND (role>=1 OR (access_until IS NOT NULL AND access_until > %s))",
+                "AND (role>=1 OR is_unlimited=1 OR (access_until IS NOT NULL AND access_until > %s))",
                 (now, now),
             )
             return cur.fetchone()["cnt"]
@@ -770,7 +763,7 @@ def get_eligible_active_count() -> int:
 
 
 def get_expired_users():
-    """Non-admin, not banned/muted users whose access time is up (includes inactive users)."""
+    """Non-admin, non-unlimited, not banned/muted users whose access time is up."""
     with _db_lock:
         conn = _conn()
         try:
@@ -778,6 +771,7 @@ def get_expired_users():
             now = _now()
             cur.execute(
                 "SELECT * FROM users WHERE is_banned=0 AND role=0 "
+                "AND (is_unlimited IS NULL OR is_unlimited=0) "
                 "AND (muted_until IS NULL OR muted_until <= %s) "
                 "AND (access_until IS NULL OR access_until <= %s)",
                 (now, now),
@@ -788,11 +782,6 @@ def get_expired_users():
 
 
 def get_users_needing_expired_reminder(min_interval_secs: int):
-    """
-    Same population as get_expired_users(), further limited to users who
-    either never got a reminder or got one more than min_interval_secs ago —
-    this is what keeps the reminder job from re-DMing the same user constantly.
-    """
     with _db_lock:
         conn = _conn()
         try:
@@ -802,6 +791,7 @@ def get_users_needing_expired_reminder(min_interval_secs: int):
                       - timedelta(seconds=min_interval_secs)).isoformat()
             cur.execute(
                 "SELECT * FROM users WHERE active=1 AND is_banned=0 AND role=0 "
+                "AND (is_unlimited IS NULL OR is_unlimited=0) "
                 "AND (muted_until IS NULL OR muted_until <= %s) "
                 "AND (access_until IS NULL OR access_until <= %s) "
                 "AND (last_expired_reminder IS NULL OR last_expired_reminder <= %s)",
@@ -912,9 +902,6 @@ def cleanup_old_relay_log():
         try:
             cur = conn.cursor()
             cur.execute("DELETE FROM relay_log WHERE sent_at<%s", (cutoff,))
-            # Keep media_rewards in lockstep with relay_log — once a batch's
-            # relay copies are gone there's nothing left for /delete to act
-            # on, so its reward record is just dead weight.
             cur.execute("DELETE FROM media_rewards WHERE created_at<%s", (cutoff,))
             conn.commit()
         finally:
@@ -922,8 +909,6 @@ def cleanup_old_relay_log():
 
 
 # ── Media reward helpers ──────────────────────────────────────────────────────
-# Ties a relay batch to the time reward its sender earned for it, so /delete
-# can report and reverse the exact amount when that media is removed.
 
 def record_media_reward(batch_id, sender_uid, media_type, earned_secs):
     with _db_lock:
@@ -1082,12 +1067,6 @@ def get_backup(file_unique_id: str):
 # ── Mute / ban state checks ───────────────────────────────────────────────────
 
 def _row_is_muted(row) -> bool:
-    """
-    Mute check against an already-fetched row — no DB call. Used for bulk
-    filtering (relay/broadcast target lists) so checking N recipients doesn't
-    cost N extra queries. Does NOT clear an expired mute (that still happens
-    lazily via is_muted()) — it's a read-only, fast-path check.
-    """
     mu = row.get("muted_until") if isinstance(row, dict) else row["muted_until"]
     if not mu:
         return False
@@ -1208,9 +1187,6 @@ def get_backup_stats():
 
 
 # ── Welcome media helpers ─────────────────────────────────────────────────────
-# Only the Telegram `file_id` is ever stored — the bot never downloads the
-# actual file, so this carries zero RAM/bandwidth cost (same principle the
-# relay itself uses for `copy_message`).
 
 def add_welcome_media(file_id: str, file_type: str, added_by: int):
     with _db_lock:
@@ -1239,7 +1215,6 @@ def count_welcome_media() -> int:
 
 
 def get_random_welcome_media(limit: int):
-    """Legacy: pick `limit` random items globally (no per-user dedup)."""
     with _db_lock:
         conn = _conn()
         try:
@@ -1255,18 +1230,10 @@ def get_random_welcome_media(limit: int):
 
 
 def get_random_welcome_media_for_user(uid: int, limit: int):
-    """
-    Pick up to `limit` welcome-media items the user has NOT already received.
-    If fewer than `limit` unseen items remain, the user's seen-list is reset
-    first so the pool starts fresh — they never get stuck with no videos.
-    Returns a list of dicts with keys: id, file_id, file_type.
-    """
     with _db_lock:
         conn = _conn()
         try:
             cur = conn.cursor()
-
-            # How many unseen items are there for this user?
             cur.execute(
                 "SELECT COUNT(*) as cnt FROM welcome_media wm "
                 "WHERE NOT EXISTS ("
@@ -1276,16 +1243,11 @@ def get_random_welcome_media_for_user(uid: int, limit: int):
                 (uid,),
             )
             unseen_count = cur.fetchone()["cnt"]
-
-            # If fewer unseen items than we need, wipe the history so we
-            # recycle the full pool rather than sending duplicates.
             if unseen_count < limit:
                 cur.execute(
                     "DELETE FROM user_welcome_media_seen WHERE user_id=%s", (uid,)
                 )
                 conn.commit()
-
-            # Pick `limit` items user hasn't seen (after potential reset).
             cur.execute(
                 "SELECT id, file_id, file_type FROM welcome_media wm "
                 "WHERE NOT EXISTS ("
@@ -1300,7 +1262,6 @@ def get_random_welcome_media_for_user(uid: int, limit: int):
 
 
 def record_welcome_media_seen(uid: int, media_ids: list):
-    """Mark a list of welcome_media.id values as seen for this user."""
     if not media_ids:
         return
     with _db_lock:
@@ -1325,7 +1286,6 @@ def clear_welcome_media():
         try:
             cur = conn.cursor()
             cur.execute("DELETE FROM welcome_media")
-            # Also wipe the seen-history — it references IDs that no longer exist.
             cur.execute("DELETE FROM user_welcome_media_seen")
             conn.commit()
         finally:

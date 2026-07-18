@@ -1,14 +1,15 @@
 # keyboards.py — All keyboard builders for the relay bot
-# Uses consistent emoji color coding:
-#   🟢 Green = Confirm / Continue / Positive
-#   🔴 Red   = Delete / Cancel / Ban / Danger
-#   🔵 Blue  = Main action / Info
-#   ⚪ Grey  = Navigation / Neutral
+# Color coding:
+#   🟢 Green  = Confirm / Continue / Positive
+#   🔴 Red    = Delete / Cancel / Ban / Danger
+#   🔵 Blue   = Main action / Info
+#   ⚪ Grey   = Navigation / Neutral
+#   ♾️ Teal   = Unlimited access users
 
 from telebot import types
 from database import (
     get_user, all_users_paged, is_main_admin, is_admin,
-    _row_access_secs, get_referral_count, get_banned_users_paged,
+    _row_access_secs, _row_is_unlimited, get_referral_count, get_banned_users_paged,
 )
 from utils import fmt_time
 from datetime import datetime, timezone
@@ -20,10 +21,7 @@ log = logging.getLogger("relay")
 # ── User main menu ────────────────────────────────────────────────────────────
 
 def user_main_keyboard():
-    """
-    Primary menu shown after /start.
-    Five clean sections — Profile, Referral, Feedback, Leave, Help.
-    """
+    """Primary menu shown after /start."""
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("👤   Profile",          callback_data="profile:show"))
     kb.add(types.InlineKeyboardButton("🔗   Referral Link",    callback_data="ref:link"))
@@ -80,11 +78,7 @@ def user_time_keyboard_refresh():
 
 
 def referral_keyboard():
-    """
-    Keyboard shown on the Referral Link page.
-    Includes a dedicated Copy Link button — tapping it shows an alert popup
-    with the raw link text so the user can long-press/copy on any platform.
-    """
+    """Keyboard shown on the Referral Link page."""
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
         types.InlineKeyboardButton("📋 Copy Referral Link",  callback_data="ref:copy"),
@@ -94,6 +88,50 @@ def referral_keyboard():
     )
     kb.add(
         types.InlineKeyboardButton("🔙 Back to Menu",        callback_data="user:menu"),
+    )
+    return kb
+
+
+# ── Feedback / Contact Admin keyboards ────────────────────────────────────────
+
+def feedback_confirm_keyboard():
+    """Shown to the user to confirm before sending their feedback message to admins."""
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("✅ Send Message",  callback_data="feedback:send"),
+        types.InlineKeyboardButton("❌ Cancel",        callback_data="feedback:cancel"),
+    )
+    return kb
+
+
+def admin_feedback_keyboard(sender_uid: int, already_read: bool = False):
+    """
+    Shown below a user's feedback message delivered to admins.
+    Provides 'Mark as Read' and 'Reply' actions.
+    """
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    read_label = "✅ Read" if already_read else "👁 Mark as Read"
+    kb.add(
+        types.InlineKeyboardButton(read_label,         callback_data=f"admin:read:{sender_uid}"),
+        types.InlineKeyboardButton("💬 Reply",          callback_data=f"admin:replyto:{sender_uid}"),
+    )
+    return kb
+
+
+def admin_feedback_read_keyboard(sender_uid: int):
+    """Keyboard shown after admin marks a feedback as read (Reply button remains)."""
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("✅ Marked as Read", callback_data="noop"))
+    kb.add(types.InlineKeyboardButton("💬 Reply to User",  callback_data=f"admin:replyto:{sender_uid}"))
+    return kb
+
+
+def admin_reply_confirm_keyboard(target_uid: int):
+    """Shown to admin to confirm before sending a reply to the user."""
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("✅ Send Reply",  callback_data=f"admin:replysend:{target_uid}"),
+        types.InlineKeyboardButton("❌ Cancel",      callback_data=f"admin:replycancel:{target_uid}"),
     )
     return kb
 
@@ -139,14 +177,21 @@ def users_keyboard(page=0):
             status = "👑"
         elif u["role"] >= 1:
             status = "🛡️"
+        elif _row_is_unlimited(u):
+            status = "♾️"
         elif not u["active"]:
             status = "💤"
         else:
             status = "🟢"
-        secs_    = _row_access_secs(u)
-        time_tag = "Unlimited" if u["role"] >= 1 else (
-            f"⏱ {fmt_time(secs_)}" if secs_ > 0 else "⌛ Expired"
-        )
+
+        if u["role"] >= 1:
+            time_tag = "∞ Unlimited"
+        elif _row_is_unlimited(u):
+            time_tag = "♾️ Unlimited"
+        else:
+            secs_ = _row_access_secs(u)
+            time_tag = f"⏱ {fmt_time(secs_)}" if secs_ > 0 else "⌛ Expired"
+
         kb.add(types.InlineKeyboardButton(
             f"{status} {name}  ·  {time_tag}",
             callback_data=f"admin:userinfo:{u['user_id']}",
@@ -169,22 +214,18 @@ def users_keyboard(page=0):
 
 
 def user_action_keyboard(target_uid, back_page=0):
-    """
-    The per-user admin panel. Kept deliberately short — one clear action per
-    row — with Mute and Usage Time opening their own focused builder screens
-    instead of sprawling across a wall of fixed-duration buttons.
-    """
+    """Per-user admin panel."""
     u = get_user(target_uid)
     if not u:
         return types.InlineKeyboardMarkup()
     kb = types.InlineKeyboardMarkup(row_width=1)
 
-    # ✉️ Direct Message — always first, the most common "reach out" action.
+    # ✉️ Direct Message
     kb.add(types.InlineKeyboardButton(
         "✉️ Direct Message", callback_data=f"admin:dm:{target_uid}"
     ))
 
-    # 🔴 Ban / 🟢 Unban — stays a single click.
+    # 🔴 Ban / 🟢 Unban
     if u["is_banned"]:
         kb.add(types.InlineKeyboardButton(
             "🟢 Unban", callback_data=f"admin:unban:{target_uid}"
@@ -194,7 +235,7 @@ def user_action_keyboard(target_uid, back_page=0):
             "🔴 Ban",   callback_data=f"admin:ban:{target_uid}"
         ))
 
-    # 🔇 Mute / 🔊 Unmute — Mute opens the unit + stepper builder below.
+    # 🔇 Mute / 🔊 Unmute
     currently_muted = False
     if u["muted_until"]:
         try:
@@ -213,10 +254,16 @@ def user_action_keyboard(target_uid, back_page=0):
             "🔇 Mute",   callback_data=f"admin:mute:{target_uid}"
         ))
 
-    # ⏰ Usage Time — opens the increase/decrease + unit + stepper builder.
+    # ⏰ Usage Time
     kb.add(types.InlineKeyboardButton(
         "⏰ Usage Time", callback_data=f"admin:usagetime:{target_uid}"
     ))
+
+    # ♾️ Unlimited Access (only if not already unlimited/admin)
+    if u["role"] == 0 and not _row_is_unlimited(u):
+        kb.add(types.InlineKeyboardButton(
+            "♾️ Grant Unlimited Access", callback_data=f"admin:unlimited:{target_uid}"
+        ))
 
     kb.add(types.InlineKeyboardButton(
         "🔙 Back to List", callback_data=f"admin:users:{back_page}"
@@ -224,18 +271,14 @@ def user_action_keyboard(target_uid, back_page=0):
     return kb
 
 
-# Cycle order for the mute-duration unit toggle: seconds → minutes → hours → …
+# Cycle order for the mute-duration unit toggle
 MUTE_UNIT_CYCLE = ["s", "m", "h"]
 MUTE_UNIT_LABEL = {"s": "Seconds", "m": "Minutes", "h": "Hours"}
 MUTE_UNIT_SHORT = {"s": "s", "m": "m", "h": "h"}
 
 
 def mute_builder_keyboard(target_uid, unit, value):
-    """
-    Nested mute screen: one button cycles the unit (s → m → h), a stepper
-    row adjusts the amount in that unit, then Confirm applies it. A Back
-    button returns to the user's profile without muting anyone.
-    """
+    """Nested mute screen with unit cycle and stepper."""
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton(
         f"🔁 Unit: {MUTE_UNIT_LABEL[unit]}",
@@ -260,11 +303,7 @@ UT_UNIT_SHORT = {"m": "m", "h": "h"}
 
 
 def usage_time_builder_keyboard(target_uid, direction, unit, value):
-    """
-    Nested usage-time screen: pick increase/decrease, pick the unit (m/h),
-    step the amount, then Confirm. A Back button returns to the profile
-    without changing the user's balance.
-    """
+    """Nested usage-time screen with direction, unit, and stepper."""
     kb = types.InlineKeyboardMarkup(row_width=1)
     dir_label = "➕ Increase Balance" if direction == "add" else "➖ Decrease Balance"
     kb.add(types.InlineKeyboardButton(
@@ -351,7 +390,6 @@ def backups_keyboard():
 # ── Gift 24h confirmation keyboard ────────────────────────────────────────────
 
 def gift24h_confirm_keyboard(expired_count: int):
-    """Confirmation dialog before gifting 24h to all expired users."""
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
         types.InlineKeyboardButton(
@@ -366,20 +404,7 @@ def gift24h_confirm_keyboard(expired_count: int):
 # ── Welcome media collection ──────────────────────────────────────────────────
 
 def welcome_collect_keyboard():
-    """Inline (glass) keyboard shown while an admin is uploading welcome media.
-
-    This used to be a ReplyKeyboardMarkup, which had two problems:
-      1. Its "✅ Done" button sent a plain text message — if that text message
-         ever slipped past the collection-mode gate (e.g. admin role revoked
-         mid-session), it would fall straight into the normal relay path and
-         get broadcast to every user in the network.
-      2. Reply keyboards are sticky per-chat: some admins ended up with the
-         button "stuck" on their keyboard permanently, unrelated to whether
-         they were still in collection mode.
-    An inline keyboard sends a callback_query instead of a text message, so it
-    can never be relayed to other users, and it isn't tied to the chat's
-    persistent keyboard at all — nothing to get "stuck".
-    """
+    """Inline keyboard shown while an admin is uploading welcome media."""
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("✅ Done", callback_data="welcome:done"))
     return kb
