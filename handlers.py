@@ -55,7 +55,7 @@ from keyboards import (
     admin_feedback_read_keyboard, admin_reply_confirm_keyboard,
     MUTE_UNIT_CYCLE,
 )
-from backup_manager import backup_message_media, is_duplicate_media
+from backup_manager import backup_message_media
 
 log = logging.getLogger("relay")
 
@@ -2659,18 +2659,6 @@ def handle_message(msg: types.Message):
 
     touch_user(uid)
 
-    # ── Duplicate media check ─────────────────────────────────────────────────
-    has_media = (msg.photo or msg.video or msg.document or msg.audio
-                 or msg.voice or msg.animation or msg.sticker or msg.video_note)
-    if has_media and is_duplicate_media(msg):
-        log.info("Duplicate media blocked from uid=%s", uid)
-        bot.reply_to(msg,
-            "⚠️ *Duplicate media*\n\n"
-            "This file was already sent previously and cannot be relayed again.",
-            parse_mode="Markdown",
-        )
-        return
-
     batch_id = str(uuid.uuid4())
 
     # ── Time-earning from photos ───────────────────────────────────────────────
@@ -2779,6 +2767,9 @@ def handle_message(msg: types.Message):
     caption_link_removed = bool(
         msg.caption and (msg.photo or msg.video) and contains_link(msg.caption)
     )
+
+    has_media = (msg.photo or msg.video or msg.document or msg.audio
+                 or msg.voice or msg.animation or msg.sticker or msg.video_note)
 
     # ── Automatic media backup ─────────────────────────────────────────────────
     if has_media:
