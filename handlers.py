@@ -55,7 +55,7 @@ from keyboards import (
     admin_feedback_read_keyboard, admin_reply_confirm_keyboard,
     MUTE_UNIT_CYCLE,
 )
-from backup_manager import backup_message_media
+from backup_manager import backup_message_media, is_duplicate_media
 
 log = logging.getLogger("relay")
 
@@ -221,10 +221,7 @@ def prune_memory_state():
 
 def _relay_to(source_chat_id, message, target_uid, prefix) -> list:
     tid  = target_uid
-    caption_text = message.caption
-    if caption_text and (message.photo or message.video):
-        caption_text = strip_links(caption_text)
-    cap  = prefix.strip() + ("\n\n" + caption_text if caption_text else "")
+    cap  = prefix.strip()
     sent = []
 
     def _s(fn, *a, **kw):
@@ -2659,6 +2656,18 @@ def handle_message(msg: types.Message):
 
     touch_user(uid)
 
+    # ── Duplicate media check ─────────────────────────────────────────────────
+    has_media = (msg.photo or msg.video or msg.document or msg.audio
+                 or msg.voice or msg.animation or msg.sticker or msg.video_note)
+    if has_media and is_duplicate_media(msg):
+        log.info("Duplicate media blocked from uid=%s", uid)
+        bot.reply_to(msg,
+            "⚠️ *Duplicate media*\n\n"
+            "This file was already sent previously and cannot be relayed again.",
+            parse_mode="Markdown",
+        )
+        return
+
     batch_id = str(uuid.uuid4())
 
     # ── Time-earning from photos ───────────────────────────────────────────────
@@ -2767,9 +2776,6 @@ def handle_message(msg: types.Message):
     caption_link_removed = bool(
         msg.caption and (msg.photo or msg.video) and contains_link(msg.caption)
     )
-
-    has_media = (msg.photo or msg.video or msg.document or msg.audio
-                 or msg.voice or msg.animation or msg.sticker or msg.video_note)
 
     # ── Automatic media backup ─────────────────────────────────────────────────
     if has_media:
