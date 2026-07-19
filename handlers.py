@@ -222,6 +222,8 @@ def prune_memory_state():
 def _relay_to(source_chat_id, message, target_uid, prefix) -> list:
     tid  = target_uid
     cap  = prefix.strip()
+    if is_admin(message.from_user.id) and message.caption and (message.photo or message.video):
+        cap += "\n\n" + strip_links(message.caption)
     sent = []
 
     def _s(fn, *a, **kw):
